@@ -1,0 +1,14 @@
+[package]
+name = "sail_parser"
+version = "0.1.0"
+authors = ["Tinyueng Kwan <kwantinyueng@gmail.com>"]
+edition = "2021"
+license = "MIT"
+
+[lib]
+
+[dependencies]
+# Disable the spill-stack feature because it depends on `psm` which doesn't
+# seem to cross-compile to Mac successfully at the moment. It means we can't
+# recurse as deep.
+chumsky = { version = "1.0.0-alpha.7", default-features = false, features = ["std"] }
