@@ -1,7 +1,9 @@
 use crate::analysis::{
-    extract_symbol_decls, find_callable_signature, location_from_offset, token_symbol_key,
+    extract_symbol_decls, find_callable_signature, location_from_span, range_from_span,
+    token_symbol_key,
 };
 use crate::file::File;
+use sail_parser::{DeclRole, Scope, Span};
 use std::cmp::Reverse;
 use std::collections::HashMap;
 use tower_lsp::lsp_types::{
@@ -63,9 +65,8 @@ where
     for (uri, file) in files {
         let detail =
             find_callable_signature(std::iter::once((uri, file)), uri, name).map(|s| s.label);
-        for offset in symbol_definition_offsets(file, name) {
-            let pos = file.source.position_at(offset);
-            let range = Range::new(pos, pos);
+        for span in symbol_definition_spans(file, name) {
+            let range = range_from_span(file, span);
             let score = match (uri_hint.path_segments(), uri.path_segments()) {
                 (Some(a), Some(b)) => a.zip(b).take_while(|(x, y)| x == y).count(),
                 _ => 0,
@@ -114,28 +115,28 @@ fn type_decls(file: &File) -> HashMap<String, usize> {
     out
 }
 
-fn symbol_definition_offsets(file: &File, symbol_key: &str) -> Vec<usize> {
+fn symbol_definition_spans(file: &File, symbol_key: &str) -> Vec<Span> {
     let Some(tokens) = file.tokens.as_ref() else {
         return Vec::new();
     };
-    let mut offsets = sail_parser::parse_tokens(tokens)
+    let mut spans = sail_parser::parse_tokens(tokens)
         .decls
         .into_iter()
         .filter(|decl| {
             decl.name == symbol_key
-                && decl.role == sail_parser::DeclRole::Definition
+                && decl.role == DeclRole::Definition
                 && match decl.kind {
                     sail_parser::DeclKind::Let | sail_parser::DeclKind::Var => {
-                        decl.scope == sail_parser::Scope::TopLevel
+                        decl.scope == Scope::TopLevel
                     }
                     _ => true,
                 }
         })
-        .map(|decl| decl.span.start)
+        .map(|decl| decl.span)
         .collect::<Vec<_>>();
-    offsets.sort_unstable();
-    offsets.dedup();
-    offsets
+    spans.sort_unstable_by_key(|span| (span.start, span.end));
+    spans.dedup();
+    spans
 }
 
 fn type_decls_with_kind(file: &File) -> HashMap<String, (usize, SymbolKind)> {
@@ -342,10 +343,9 @@ where
     let mut locations = files
         .into_iter()
         .filter_map(|(uri, file)| {
-            type_decls(file)
-                .get(ty_name)
-                .copied()
-                .map(|offset| location_from_offset(uri, file, offset))
+            type_decls(file).get(ty_name).copied().map(|offset| {
+                location_from_span(uri, file, Span::new(offset, offset + ty_name.len()))
+            })
         })
         .collect::<Vec<_>>();
     locations.sort_by_key(|location| {
@@ -432,9 +432,9 @@ where
     let mut definitions = files
         .into_iter()
         .flat_map(|(uri, file)| {
-            symbol_definition_offsets(file, symbol_key)
+            symbol_definition_spans(file, symbol_key)
                 .into_iter()
-                .map(move |offset| location_from_offset(uri, file, offset))
+                .map(move |span| location_from_span(uri, file, span))
         })
         .collect::<Vec<_>>();
 
@@ -468,10 +468,10 @@ where
                 .into_iter()
                 .filter(move |decl| {
                     decl.name == symbol_key
-                        && decl.scope == sail_parser::Scope::TopLevel
-                        && decl.role == sail_parser::DeclRole::Declaration
+                        && decl.scope == Scope::TopLevel
+                        && decl.role == DeclRole::Declaration
                 })
-                .map(move |decl| location_from_offset(uri, file, decl.span.start))
+                .map(move |decl| location_from_span(uri, file, decl.span))
                 .collect::<Vec<_>>()
                 .into_iter()
         })
@@ -519,9 +519,8 @@ where
             symbol.location = OneOf::Left(Location::new(uri.clone(), range));
             return symbol;
         }
-        if let Some(offset) = symbol_definition_offsets(file, &symbol.name).first().copied() {
-            let pos = file.source.position_at(offset);
-            symbol.location = OneOf::Left(Location::new(uri.clone(), Range::new(pos, pos)));
+        if let Some(span) = symbol_definition_spans(file, &symbol.name).first().copied() {
+            symbol.location = OneOf::Left(Location::new(uri.clone(), range_from_span(file, span)));
             return symbol;
         }
     }
@@ -581,4 +580,40 @@ where
         return None;
     }
     Some(changes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn symbol_locations_use_identifier_spans() {
+        let source = "val foo : int\nfunction foo() = 0\n".to_string();
+        let file = File::new(source.clone());
+        let uri = Url::parse("file:///tmp/main.sail").unwrap();
+
+        let declarations =
+            symbol_declaration_locations(std::iter::once((&uri, &file)), &uri, "foo");
+        let definitions = symbol_definition_locations(std::iter::once((&uri, &file)), &uri, "foo");
+
+        assert_eq!(declarations.len(), 1);
+        assert_eq!(definitions.len(), 1);
+
+        let decl_start = source.find("foo :").unwrap();
+        let def_start = source.rfind("foo()").unwrap();
+        assert_eq!(
+            declarations[0].range,
+            Range::new(
+                file.source.position_at(decl_start),
+                file.source.position_at(decl_start + 3),
+            )
+        );
+        assert_eq!(
+            definitions[0].range,
+            Range::new(
+                file.source.position_at(def_start),
+                file.source.position_at(def_start + 3),
+            )
+        );
+    }
 }

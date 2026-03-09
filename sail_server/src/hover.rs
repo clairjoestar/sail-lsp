@@ -2,7 +2,7 @@ use crate::analysis::{collect_callable_signatures, infer_binding_type, CallableS
 use crate::file::File;
 use sail_parser::{Decl, DeclKind, DeclRole, Scope, Span, Token};
 use tower_lsp::lsp_types::{
-    Hover, HoverContents, MarkupContent, MarkupKind, Position, SymbolKind, Url,
+    Hover, HoverContents, MarkupContent, MarkupKind, Position, Range, SymbolKind, Url,
 };
 
 pub(crate) fn hover_for_symbol<'a, I>(
@@ -10,13 +10,14 @@ pub(crate) fn hover_for_symbol<'a, I>(
     current_uri: &Url,
     current_file: &File,
     position: Position,
+    hover_range: Range,
     symbol_key: &str,
 ) -> Option<Hover>
 where
     I: IntoIterator<Item = (&'a Url, &'a File)>,
 {
     if symbol_key.starts_with('\'') {
-        return Some(markdown_hover(fenced_sail(symbol_key)));
+        return Some(markdown_hover(fenced_sail(symbol_key), hover_range));
     }
 
     let files = files.into_iter().collect::<Vec<_>>();
@@ -31,14 +32,25 @@ where
 
     let snippets = if let Some(decl_ref) = decl_ref.as_ref() {
         if is_callable_decl(decl_ref.decl.kind) {
-            let callables = collect_callable_hover_snippets(files.iter().copied(), current_uri, symbol_key);
+            let callables =
+                collect_callable_hover_snippets(files.iter().copied(), current_uri, symbol_key);
             if callables.is_empty() {
-                vec![render_signature(decl_ref, files.iter().copied(), current_uri, symbol_key)]
+                vec![render_signature(
+                    decl_ref,
+                    files.iter().copied(),
+                    current_uri,
+                    symbol_key,
+                )]
             } else {
                 callables
             }
         } else {
-            vec![render_signature(decl_ref, files.iter().copied(), current_uri, symbol_key)]
+            vec![render_signature(
+                decl_ref,
+                files.iter().copied(),
+                current_uri,
+                symbol_key,
+            )]
         }
     } else {
         vec![symbol_key.to_string()]
@@ -49,16 +61,16 @@ where
         .map(|snippet| fenced_sail(&snippet))
         .collect::<Vec<_>>()
         .join("\n\n---\n");
-    Some(markdown_hover(markup))
+    Some(markdown_hover(markup, hover_range))
 }
 
-fn markdown_hover(markdown: String) -> Hover {
+fn markdown_hover(markdown: String, range: Range) -> Hover {
     Hover {
         contents: HoverContents::Markup(MarkupContent {
             kind: MarkupKind::Markdown,
             value: markdown,
         }),
-        range: None,
+        range: Some(range),
     }
 }
 
@@ -100,7 +112,11 @@ fn symbol_kind_for_decl(kind: DeclKind) -> SymbolKind {
         DeclKind::Register | DeclKind::Let | DeclKind::Var => SymbolKind::VARIABLE,
         DeclKind::Enum => SymbolKind::ENUM,
         DeclKind::EnumMember => SymbolKind::ENUM_MEMBER,
-        DeclKind::Type | DeclKind::Struct | DeclKind::Union | DeclKind::Bitfield | DeclKind::Newtype => SymbolKind::STRUCT,
+        DeclKind::Type
+        | DeclKind::Struct
+        | DeclKind::Union
+        | DeclKind::Bitfield
+        | DeclKind::Newtype => SymbolKind::STRUCT,
     }
 }
 
@@ -137,7 +153,10 @@ fn decl_headline(file: &File, decl: &Decl) -> String {
     let Some(tokens) = file.tokens.as_ref() else {
         return format!("{} {}", decl_kind_label(decl.kind), decl.name);
     };
-    let Some(idx) = tokens.iter().position(|(_, span)| span.start == decl.span.start) else {
+    let Some(idx) = tokens
+        .iter()
+        .position(|(_, span)| span.start == decl.span.start)
+    else {
         return format!("{} {}", decl_kind_label(decl.kind), decl.name);
     };
     let text = file.source.text();
@@ -228,7 +247,9 @@ where
                 .decls
                 .into_iter()
                 .filter(|decl| {
-                    decl.name == symbol_key && decl.scope == Scope::Local && decl.span.start <= offset
+                    decl.name == symbol_key
+                        && decl.scope == Scope::Local
+                        && decl.span.start <= offset
                 })
                 .max_by_key(|decl| decl.span.start)
             {
@@ -242,9 +263,14 @@ where
         let Some(tokens) = file.tokens.as_ref() else {
             continue;
         };
-        for decl in sail_parser::parse_tokens(tokens).decls.into_iter().filter(|decl| {
-            decl.name == symbol_key && (decl.scope == Scope::TopLevel || decl.kind == DeclKind::EnumMember)
-        }) {
+        for decl in sail_parser::parse_tokens(tokens)
+            .decls
+            .into_iter()
+            .filter(|decl| {
+                decl.name == symbol_key
+                    && (decl.scope == Scope::TopLevel || decl.kind == DeclKind::EnumMember)
+            })
+        {
             let mut score = uri_prefix_score(current_uri, uri) * 16;
             if uri == current_uri {
                 score += 8;
@@ -359,7 +385,9 @@ fn binding_type_hint(file: &File, decl: &Decl) -> Option<String> {
         let mut end_idx = idx + 2;
         while end_idx < tokens.len() {
             let token = &tokens[end_idx].0;
-            if *token == Token::Equal || *token == Token::Semicolon || token_starts_declaration(token)
+            if *token == Token::Equal
+                || *token == Token::Semicolon
+                || token_starts_declaration(token)
             {
                 break;
             }
@@ -392,9 +420,7 @@ fn binding_type_hint(file: &File, decl: &Decl) -> Option<String> {
 }
 
 enum EnumInfo {
-    Member {
-        enum_name: String,
-    },
+    Member { enum_name: String },
 }
 
 fn enum_info_for_symbol(file: &File, symbol: &str) -> Option<EnumInfo> {
@@ -451,7 +477,7 @@ fn enum_info_for_symbol(file: &File, symbol: &str) -> Option<EnumInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tower_lsp::lsp_types::Url;
+    use tower_lsp::lsp_types::{Range, Url};
 
     fn hover_markdown(hover: Hover) -> String {
         match hover.contents {
@@ -472,6 +498,10 @@ mod tests {
             &uri,
             &file,
             pos,
+            Range::new(
+                pos,
+                file.source.position_at(source.find("add(x)").unwrap() + 3),
+            ),
             "add",
         )
         .expect("hover");
@@ -493,6 +523,7 @@ mod tests {
             &uri,
             &file,
             pos,
+            Range::new(pos, file.source.position_at(source.rfind("x").unwrap() + 1)),
             "x",
         )
         .expect("hover");
@@ -512,6 +543,10 @@ mod tests {
             &uri,
             &file,
             pos,
+            Range::new(
+                pos,
+                file.source.position_at(source.rfind("Red").unwrap() + 3),
+            ),
             "Red",
         )
         .expect("hover");
@@ -529,10 +564,36 @@ mod tests {
             &uri,
             &file,
             pos,
+            Range::new(pos, Position::new(0, 2)),
             "'n",
         )
         .expect("hover");
         let markdown = hover_markdown(hover);
         assert_eq!(markdown.trim(), "```sail\n'n\n```");
+    }
+
+    #[test]
+    fn returns_precise_hover_range_for_identifier() {
+        let source = "val add : int -> int\nfunction add(x) = x\n".to_string();
+        let file = File::new(source.clone());
+        let uri = Url::parse("file:///tmp/main.sail").unwrap();
+        let name_offset = source.rfind("add").unwrap();
+        let pos = file.source.position_at(name_offset + 1);
+        let hover_range = Range::new(
+            file.source.position_at(name_offset),
+            file.source.position_at(name_offset + 3),
+        );
+
+        let hover = hover_for_symbol(
+            std::iter::once((&uri, &file)),
+            &uri,
+            &file,
+            pos,
+            hover_range,
+            "add",
+        )
+        .expect("hover");
+
+        assert_eq!(hover.range, Some(hover_range));
     }
 }

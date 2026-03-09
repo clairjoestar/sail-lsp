@@ -19,13 +19,12 @@ use tower_lsp::lsp_types::{
     DidChangeWatchedFilesParams, DidChangeWatchedFilesRegistrationOptions,
     DidChangeWorkspaceFoldersParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
     DidSaveTextDocumentParams, DocumentDiagnosticParams, DocumentDiagnosticReportResult,
-    DocumentFormattingParams, DocumentHighlight,
-    DocumentHighlightKind, DocumentHighlightParams, DocumentLink, DocumentLinkOptions,
-    DocumentLinkParams, DocumentOnTypeFormattingOptions, DocumentOnTypeFormattingParams,
-    DocumentRangeFormattingParams, DocumentSymbolParams, DocumentSymbolResponse,
-    ExecuteCommandParams, FileOperationFilter, FileOperationPattern, FileOperationPatternKind,
-    FileOperationRegistrationOptions, FileSystemWatcher, FoldingRange, FoldingRangeKind,
-    FoldingRangeParams, GlobPattern, GotoDefinitionParams,
+    DocumentFormattingParams, DocumentHighlight, DocumentHighlightKind, DocumentHighlightParams,
+    DocumentLink, DocumentLinkOptions, DocumentLinkParams, DocumentOnTypeFormattingOptions,
+    DocumentOnTypeFormattingParams, DocumentRangeFormattingParams, DocumentSymbolParams,
+    DocumentSymbolResponse, ExecuteCommandParams, FileOperationFilter, FileOperationPattern,
+    FileOperationPatternKind, FileOperationRegistrationOptions, FileSystemWatcher, FoldingRange,
+    FoldingRangeKind, FoldingRangeParams, GlobPattern, GotoDefinitionParams,
     GotoDefinitionResponse, Hover, HoverParams, HoverProviderCapability,
     ImplementationProviderCapability, InitializeParams, InitializeResult, InitializedParams,
     InlayHint, InlayHintKind, InlayHintOptions, InlayHintParams, InlayHintServerCapabilities,
@@ -63,13 +62,13 @@ mod rename_utils;
 mod semantic_tokens;
 mod signature;
 
+#[cfg(test)]
+use analysis::{collect_callable_signatures, function_snippet};
 use analysis::{
     extract_symbol_decls, find_call_at_position, find_callable_signature, infer_binding_type,
     inlay_param_name, is_definition_at, location_from_offset, token_is_close_bracket,
     token_is_open_bracket, token_symbol_key,
 };
-#[cfg(test)]
-use analysis::{collect_callable_signatures, function_snippet};
 use code_action_utils::{
     code_action_kind_allowed, default_code_action_format_options, lazy_code_action_data,
     resolve_code_action_edit_from_data, sail_source_fix_all_kind,
@@ -95,9 +94,8 @@ use lenses::{
 use navigation::{
     call_edges, call_hierarchy_item, implementation_locations, parse_named_type,
     resolve_workspace_symbol, symbol_declaration_locations, symbol_definition_locations,
-    type_definition_locations, type_hierarchy_item,
-    type_name_candidates_at_position, type_subtypes, type_supertypes, typed_bindings,
-    will_rename_file_edits,
+    type_definition_locations, type_hierarchy_item, type_name_candidates_at_position,
+    type_subtypes, type_supertypes, typed_bindings, will_rename_file_edits,
 };
 #[cfg(test)]
 use navigation::{call_edges_for_file, type_alias_edges};
@@ -108,7 +106,9 @@ use semantic_tokens::{
 };
 use signature::signature_help_for_position;
 #[cfg(test)]
-use tower_lsp::lsp_types::{DocumentDiagnosticReport, FormattingOptions, SymbolKind, WorkspaceLocation};
+use tower_lsp::lsp_types::{
+    DocumentDiagnosticReport, FormattingOptions, SymbolKind, WorkspaceLocation,
+};
 
 #[derive(Default)]
 struct State {
@@ -1424,7 +1424,7 @@ impl LanguageServer for Backend {
         let Some(file) = file else {
             return Ok(None);
         };
-        let Some((token, _)) = file.token_at(position) else {
+        let Some((token, span)) = file.token_at(position) else {
             return Ok(None);
         };
         let Some(symbol_key) = token_symbol_key(token) else {
@@ -1436,6 +1436,10 @@ impl LanguageServer for Backend {
             uri,
             file,
             position,
+            Range::new(
+                file.source.position_at(span.start),
+                file.source.position_at(span.end),
+            ),
             &symbol_key,
         ))
     }

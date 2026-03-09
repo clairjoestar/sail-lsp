@@ -1,4 +1,5 @@
 use crate::file::File;
+use sail_parser::Span;
 use tower_lsp::lsp_types::{Location, Range, SymbolKind, Url};
 
 #[derive(Clone)]
@@ -70,6 +71,17 @@ pub(crate) fn extract_symbol_decls(file: &File) -> Vec<SymbolDecl> {
 pub(crate) fn location_from_offset(uri: &Url, file: &File, offset: usize) -> Location {
     let position = file.source.position_at(offset);
     Location::new(uri.clone(), Range::new(position, position))
+}
+
+pub(crate) fn range_from_span(file: &File, span: Span) -> Range {
+    Range::new(
+        file.source.position_at(span.start),
+        file.source.position_at(span.end),
+    )
+}
+
+pub(crate) fn location_from_span(uri: &Url, file: &File, span: Span) -> Location {
+    Location::new(uri.clone(), range_from_span(file, span))
 }
 
 pub(crate) fn is_definition_at(file: &File, name: &str, offset: usize) -> bool {
