@@ -2110,8 +2110,7 @@ fn parse_pattern(tokens: &[(Token, Span)], start: usize, end: usize) -> Spanned<
         };
     }
 
-    if tokens[start].0 == Token::LeftSquareBracket
-        && find_matching_bracket(tokens, start) == Some(end)
+    if tokens[start].0 == Token::LeftSquareBar && find_matching_bracket(tokens, start) == Some(end)
     {
         let items = if start + 1 < end {
             split_top_level_segments(tokens, start + 1, end - 1, |token| *token == Token::Comma)
@@ -2126,7 +2125,8 @@ fn parse_pattern(tokens: &[(Token, Span)], start: usize, end: usize) -> Spanned<
         return (Pattern::List(items), span);
     }
 
-    if tokens[start].0 == Token::LeftSquareBar && find_matching_bracket(tokens, start) == Some(end)
+    if tokens[start].0 == Token::LeftSquareBracket
+        && find_matching_bracket(tokens, start) == Some(end)
     {
         let items = if start + 1 < end {
             split_top_level_segments(tokens, start + 1, end - 1, |token| *token == Token::Comma)
@@ -2217,7 +2217,7 @@ fn parse_pattern(tokens: &[(Token, Span)], start: usize, end: usize) -> Spanned<
             return (
                 Pattern::App {
                     callee: (name, name_span),
-                    args: Vec::new(),
+                    args: vec![unit_pattern(tokens[next_idx].1)],
                 },
                 span,
             );
@@ -2678,7 +2678,7 @@ fn parse_atomic_base(
             if close_idx <= end {
                 let expr = if start + 1 == close_idx {
                     (
-                        Expr::List(Vec::new()),
+                        Expr::Vector(Vec::new()),
                         span_for_indices(tokens, start, close_idx),
                     )
                 } else if let Some(with_idx) =
@@ -2686,6 +2686,7 @@ fn parse_atomic_base(
                         *token == Token::KwWith
                     })
                 {
+                    let span = span_for_indices(tokens, start, close_idx);
                     let updates = if with_idx < close_idx - 1 {
                         split_top_level_segments(tokens, with_idx + 1, close_idx - 1, |token| {
                             *token == Token::Comma
@@ -2698,16 +2699,12 @@ fn parse_atomic_base(
                     } else {
                         Vec::new()
                     };
-                    (
-                        Expr::VectorUpdate {
-                            base: Box::new(parse_expr(
-                                tokens,
-                                start + 1,
-                                with_idx.saturating_sub(1),
-                            )),
-                            updates,
-                        },
-                        span_for_indices(tokens, start, close_idx),
+                    desugar_vector_update_expr(
+                        parse_expr(tokens, start + 1, with_idx.saturating_sub(1)),
+                        updates,
+                        span,
+                        tokens[start].1,
+                        tokens[close_idx].1,
                     )
                 } else {
                     let items =
@@ -2720,7 +2717,7 @@ fn parse_atomic_base(
                         })
                         .collect();
                     (
-                        Expr::List(items),
+                        Expr::Vector(items),
                         span_for_indices(tokens, start, close_idx),
                     )
                 };
@@ -2744,7 +2741,7 @@ fn parse_atomic_base(
                 };
                 return Some((
                     (
-                        Expr::Vector(items),
+                        Expr::List(items),
                         span_for_indices(tokens, start, close_idx),
                     ),
                     close_idx + 1,
@@ -2759,6 +2756,106 @@ fn parse_atomic_base(
     }
 
     None
+}
+
+fn modifier_call_receiver(expr: &Spanned<Expr>, via_arrow: bool) -> Option<Spanned<Expr>> {
+    if via_arrow {
+        match &expr.0 {
+            Expr::Ident(name) => Some((Expr::Ref((name.clone(), expr.1)), expr.1)),
+            _ => None,
+        }
+    } else {
+        Some(expr.clone())
+    }
+}
+
+fn unit_expr(span: Span) -> Spanned<Expr> {
+    (Expr::Literal(Literal::Unit), span)
+}
+
+fn unit_pattern(span: Span) -> Spanned<Pattern> {
+    (Pattern::Literal(Literal::Unit), span)
+}
+
+fn ident_call_expr(
+    callee: Spanned<String>,
+    args: Vec<Spanned<Expr>>,
+    open_span: Span,
+    close_span: Span,
+    arg_separator_spans: Vec<Span>,
+    expr_start: usize,
+) -> Spanned<Expr> {
+    (
+        Expr::Call(Call {
+            callee: Box::new((Expr::Ident(callee.0), callee.1)),
+            args,
+            open_span,
+            close_span,
+            arg_separator_spans,
+        }),
+        Span::new(expr_start, close_span.end),
+    )
+}
+
+fn desugar_vector_update_expr(
+    mut base: Spanned<Expr>,
+    updates: Vec<Spanned<VectorUpdate>>,
+    span: Span,
+    open_span: Span,
+    close_span: Span,
+) -> Spanned<Expr> {
+    for update in updates {
+        let (callee_name, args) = match update.0 {
+            VectorUpdate::Assignment { target, value } => {
+                ("vector_update#".to_string(), vec![base, target, value])
+            }
+            VectorUpdate::RangeAssignment { start, end, value } => (
+                "vector_update_subrange#".to_string(),
+                vec![base, start, end, value],
+            ),
+            VectorUpdate::Shorthand(name) => {
+                let ident = (Expr::Ident(name.0.clone()), name.1);
+                (
+                    "vector_update#".to_string(),
+                    vec![base, ident.clone(), ident],
+                )
+            }
+        };
+        base = ident_call_expr(
+            (callee_name, update.1),
+            args,
+            open_span,
+            close_span,
+            Vec::new(),
+            span.start,
+        );
+    }
+
+    base
+}
+
+fn modifier_call_expr(
+    receiver: Spanned<Expr>,
+    field: Spanned<String>,
+    open_span: Span,
+    close_span: Span,
+    mut explicit_args: Vec<Spanned<Expr>>,
+    arg_separator_spans: Vec<Span>,
+) -> Spanned<Expr> {
+    let receiver_start = receiver.1.start;
+    let mut args = Vec::with_capacity(explicit_args.len() + 1);
+    args.push(receiver);
+    args.append(&mut explicit_args);
+    (
+        Expr::Call(Call {
+            callee: Box::new((Expr::Ident(format!("_mod_{}", field.0)), field.1)),
+            args,
+            open_span,
+            close_span,
+            arg_separator_spans,
+        }),
+        Span::new(receiver_start, close_span.end),
+    )
 }
 
 fn parse_prefixed_atomic_expr_with_end(
@@ -2785,10 +2882,14 @@ fn parse_prefixed_atomic_expr_with_end(
                 // The lexer canonicalizes `()` into a single token, so `f()` reaches the
                 // parser as `Id("f"), Unit` instead of a `(` ... `)` suffix pair.
                 let unit_span = tokens[next_idx].1;
+                let args = match expr.0 {
+                    Expr::Ident(_) => vec![unit_expr(unit_span)],
+                    _ => Vec::new(),
+                };
                 expr = (
                     Expr::Call(Call {
                         callee: Box::new(expr),
-                        args: Vec::new(),
+                        args,
                         open_span: unit_span,
                         close_span: unit_span,
                         arg_separator_spans: Vec::new(),
@@ -2835,10 +2936,63 @@ fn parse_prefixed_atomic_expr_with_end(
                     return None;
                 };
                 let field_span = tokens[next_idx + 1].1;
+                let field = (field_name, field_span);
+                if next_idx + 2 <= end {
+                    match tokens[next_idx + 2].0 {
+                        Token::Unit => {
+                            if let Some(receiver) = modifier_call_receiver(&expr, via_arrow) {
+                                let unit_span = tokens[next_idx + 2].1;
+                                expr = modifier_call_expr(
+                                    receiver,
+                                    field,
+                                    unit_span,
+                                    unit_span,
+                                    Vec::new(),
+                                    Vec::new(),
+                                );
+                                next_idx += 3;
+                                continue;
+                            }
+                        }
+                        Token::LeftBracket => {
+                            let Some(close_idx) = find_matching_round_bracket(tokens, next_idx + 2)
+                            else {
+                                return None;
+                            };
+                            if close_idx > end {
+                                return None;
+                            }
+                            if let Some(receiver) = modifier_call_receiver(&expr, via_arrow) {
+                                let (arg_ranges, separators) = if next_idx + 3 < close_idx {
+                                    split_top_level_commas(tokens, next_idx + 3, close_idx - 1)
+                                } else {
+                                    (Vec::new(), Vec::new())
+                                };
+                                let args = arg_ranges
+                                    .into_iter()
+                                    .map(|(arg_start, arg_end)| {
+                                        parse_expr(tokens, arg_start, arg_end)
+                                    })
+                                    .collect();
+                                expr = modifier_call_expr(
+                                    receiver,
+                                    field,
+                                    tokens[next_idx + 2].1,
+                                    tokens[close_idx].1,
+                                    args,
+                                    separators,
+                                );
+                                next_idx = close_idx + 1;
+                                continue;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
                 expr = (
                     Expr::Field {
                         expr: Box::new(expr),
-                        field: (field_name, field_span),
+                        field,
                         via_arrow,
                     },
                     span_for_indices(tokens, idx, next_idx + 1),
@@ -2854,34 +3008,49 @@ fn parse_prefixed_atomic_expr_with_end(
                 }
                 let inner_start = next_idx + 1;
                 let inner_end = close_idx - 1;
+                let expr_start = expr.1.start;
                 let next_expr = if let Some(comma_idx) =
                     find_top_level_token(tokens, inner_start, inner_end, |token| {
                         *token == Token::Comma
                     }) {
-                    Expr::VectorSlice {
-                        expr: Box::new(expr),
-                        start: Box::new(parse_expr(
-                            tokens,
-                            inner_start,
-                            comma_idx.saturating_sub(1),
-                        )),
-                        length: Box::new(parse_expr(tokens, comma_idx + 1, inner_end)),
-                    }
+                    ident_call_expr(
+                        ("slice".to_string(), tokens[next_idx].1),
+                        vec![
+                            expr,
+                            parse_expr(tokens, inner_start, comma_idx.saturating_sub(1)),
+                            parse_expr(tokens, comma_idx + 1, inner_end),
+                        ],
+                        tokens[next_idx].1,
+                        tokens[close_idx].1,
+                        vec![tokens[comma_idx].1],
+                        expr_start,
+                    )
                 } else if let Some(dd_idx) =
                     find_top_level_double_dot(tokens, inner_start, inner_end)
                 {
-                    Expr::Slice {
-                        expr: Box::new(expr),
-                        start: Box::new(parse_expr(tokens, inner_start, dd_idx.saturating_sub(1))),
-                        end: Box::new(parse_expr(tokens, dd_idx + 2, inner_end)),
-                    }
+                    ident_call_expr(
+                        ("vector_subrange#".to_string(), tokens[next_idx].1),
+                        vec![
+                            expr,
+                            parse_expr(tokens, inner_start, dd_idx.saturating_sub(1)),
+                            parse_expr(tokens, dd_idx + 2, inner_end),
+                        ],
+                        tokens[next_idx].1,
+                        tokens[close_idx].1,
+                        Vec::new(),
+                        expr_start,
+                    )
                 } else {
-                    Expr::Index {
-                        expr: Box::new(expr),
-                        index: Box::new(parse_expr(tokens, inner_start, inner_end)),
-                    }
+                    ident_call_expr(
+                        ("vector_access#".to_string(), tokens[next_idx].1),
+                        vec![expr, parse_expr(tokens, inner_start, inner_end)],
+                        tokens[next_idx].1,
+                        tokens[close_idx].1,
+                        Vec::new(),
+                        expr_start,
+                    )
                 };
-                expr = (next_expr, span_for_indices(tokens, idx, close_idx));
+                expr = next_expr;
                 next_idx = close_idx + 1;
             }
             Token::Colon => {
@@ -4926,7 +5095,9 @@ function f(xs, opt) = {
         };
         assert!(matches!(
             &cases[0].0.pattern.0,
-            Pattern::App { callee, args } if callee.0 == "None" && args.is_empty()
+            Pattern::App { callee, args }
+                if callee.0 == "None"
+                    && matches!(args.as_slice(), [(Pattern::Literal(Literal::Unit), _)])
         ));
     }
 
@@ -5626,13 +5797,220 @@ function foo(r, v) = {
         };
         assert!(matches!(
             &items[0].0,
-            BlockItem::Var { value: (Expr::VectorUpdate { updates, .. }, _), .. }
-                if updates.len() == 2
+            BlockItem::Var { value: (Expr::Call(call), _), .. }
+                if matches!(&call.callee.0, Expr::Ident(name) if name == "vector_update_subrange#")
         ));
         assert!(matches!(
             &items[1].0,
             BlockItem::Expr((Expr::Match { cases, .. }, _)) if cases.len() == 2
         ));
+    }
+
+    #[test]
+    fn parses_official_list_and_vector_syntax() {
+        let source = r#"
+function f(xs) = {
+  let v = [1, 2];
+  let l = [|1, 2|];
+  match xs {
+    [x, y] => v,
+    [|a, b|] => l
+  }
+}
+"#;
+        let tokens = crate::lexer().parse(source).into_result().unwrap();
+        let ast = parse_source(&tokens).into_result().unwrap();
+
+        let TopLevelDef::CallableDef(def) = &ast.items[0].0 else {
+            panic!("expected callable def");
+        };
+        let Some((Expr::Block(items), _)) = &def.body else {
+            panic!("expected block body");
+        };
+
+        assert!(matches!(
+            &items[0].0,
+            BlockItem::Let(LetBinding { value, .. })
+                if matches!(value.as_ref().0, Expr::Vector(ref items) if items.len() == 2)
+        ));
+        assert!(matches!(
+            &items[1].0,
+            BlockItem::Let(LetBinding { value, .. })
+                if matches!(value.as_ref().0, Expr::List(ref items) if items.len() == 2)
+        ));
+
+        let BlockItem::Expr((Expr::Match { cases, .. }, _)) = &items[2].0 else {
+            panic!("expected match expression");
+        };
+        assert!(matches!(&cases[0].0.pattern.0, Pattern::Vector(items) if items.len() == 2));
+        assert!(matches!(&cases[1].0.pattern.0, Pattern::List(items) if items.len() == 2));
+    }
+
+    #[test]
+    fn rewrites_official_modifier_call_sugar_in_parser() {
+        let source = r#"
+function dot(x, y) = x.foo(y)
+function arrow(r) = r->bar()
+function field(x) = x.foo
+"#;
+        let tokens = crate::lexer().parse(source).into_result().unwrap();
+        let ast = parse_source(&tokens).into_result().unwrap();
+
+        let TopLevelDef::CallableDef(dot_def) = &ast.items[0].0 else {
+            panic!("expected dot callable def");
+        };
+        let Some((Expr::Call(call), _)) = &dot_def.body else {
+            panic!("expected dot modifier call");
+        };
+        assert!(matches!(&call.callee.0, Expr::Ident(name) if name == "_mod_foo"));
+        assert!(matches!(&call.args[0].0, Expr::Ident(name) if name == "x"));
+        assert!(matches!(&call.args[1].0, Expr::Ident(name) if name == "y"));
+
+        let TopLevelDef::CallableDef(arrow_def) = &ast.items[1].0 else {
+            panic!("expected arrow callable def");
+        };
+        let Some((Expr::Call(call), _)) = &arrow_def.body else {
+            panic!("expected arrow modifier call");
+        };
+        assert!(matches!(&call.callee.0, Expr::Ident(name) if name == "_mod_bar"));
+        assert!(matches!(&call.args[0].0, Expr::Ref((name, _)) if name == "r"));
+        assert_eq!(call.args.len(), 1);
+
+        let TopLevelDef::CallableDef(field_def) = &ast.items[2].0 else {
+            panic!("expected field callable def");
+        };
+        assert!(matches!(
+            &field_def.body,
+            Some((Expr::Field { field, via_arrow, .. }, _))
+                if field.0 == "foo" && !via_arrow
+        ));
+    }
+
+    #[test]
+    fn rewrites_unit_calls_and_patterns_like_official_parser() {
+        let source = r#"
+function use(foo) = foo()
+function match_none(xs) = match xs { None() => 0 }
+"#;
+        let tokens = crate::lexer().parse(source).into_result().unwrap();
+        let ast = parse_source(&tokens).into_result().unwrap();
+
+        let TopLevelDef::CallableDef(use_def) = &ast.items[0].0 else {
+            panic!("expected use callable def");
+        };
+        let Some((Expr::Call(call), _)) = &use_def.body else {
+            panic!("expected unit call");
+        };
+        assert!(matches!(&call.callee.0, Expr::Ident(name) if name == "foo"));
+        assert!(matches!(
+            call.args.as_slice(),
+            [(Expr::Literal(Literal::Unit), _)]
+        ));
+
+        let TopLevelDef::CallableDef(match_def) = &ast.items[1].0 else {
+            panic!("expected match callable def");
+        };
+        let Some((Expr::Match { cases, .. }, _)) = &match_def.body else {
+            panic!("expected match body");
+        };
+        assert!(matches!(
+            &cases[0].0.pattern.0,
+            Pattern::App { callee, args }
+                if callee.0 == "None"
+                    && matches!(args.as_slice(), [(Pattern::Literal(Literal::Unit), _)])
+        ));
+    }
+
+    #[test]
+    fn rewrites_comma_slice_sugar_in_parser() {
+        let source = "function mid(x) = x[2, 3]\n";
+        let tokens = crate::lexer().parse(source).into_result().unwrap();
+        let ast = parse_source(&tokens).into_result().unwrap();
+
+        let TopLevelDef::CallableDef(def) = &ast.items[0].0 else {
+            panic!("expected callable def");
+        };
+        let Some((Expr::Call(call), _)) = &def.body else {
+            panic!("expected slice call");
+        };
+        assert!(matches!(&call.callee.0, Expr::Ident(name) if name == "slice"));
+        assert!(matches!(&call.args[0].0, Expr::Ident(name) if name == "x"));
+        assert!(matches!(&call.args[1].0, Expr::Literal(Literal::Number(ref n)) if n == "2"));
+        assert!(matches!(&call.args[2].0, Expr::Literal(Literal::Number(ref n)) if n == "3"));
+        assert_eq!(call.arg_separator_spans.len(), 1);
+    }
+
+    #[test]
+    fn rewrites_vector_access_and_subrange_into_builtin_calls() {
+        let source = "function proj(x) = (x[3], x[7 .. 4])\n";
+        let tokens = crate::lexer().parse(source).into_result().unwrap();
+        let ast = parse_source(&tokens).into_result().unwrap();
+
+        let TopLevelDef::CallableDef(def) = &ast.items[0].0 else {
+            panic!("expected callable def");
+        };
+        let Some((Expr::Tuple(items), _)) = &def.body else {
+            panic!("expected tuple body");
+        };
+
+        let Expr::Call(access) = &items[0].0 else {
+            panic!("expected vector access call");
+        };
+        assert!(matches!(
+            &access.callee.0,
+            Expr::Ident(name) if name == "vector_access#"
+        ));
+        assert!(matches!(&access.args[0].0, Expr::Ident(name) if name == "x"));
+        assert!(matches!(&access.args[1].0, Expr::Literal(Literal::Number(ref n)) if n == "3"));
+
+        let Expr::Call(subrange) = &items[1].0 else {
+            panic!("expected vector subrange call");
+        };
+        assert!(matches!(
+            &subrange.callee.0,
+            Expr::Ident(name) if name == "vector_subrange#"
+        ));
+        assert!(matches!(&subrange.args[0].0, Expr::Ident(name) if name == "x"));
+        assert!(matches!(
+            &subrange.args[1].0,
+            Expr::Literal(Literal::Number(ref n)) if n == "7"
+        ));
+        assert!(matches!(
+            &subrange.args[2].0,
+            Expr::Literal(Literal::Number(ref n)) if n == "4"
+        ));
+    }
+
+    #[test]
+    fn rewrites_vector_updates_into_nested_builtin_calls() {
+        let source = "function patch(x, y, z) = [x with 0 = y, 7 .. 4 = z]\n";
+        let tokens = crate::lexer().parse(source).into_result().unwrap();
+        let ast = parse_source(&tokens).into_result().unwrap();
+
+        let TopLevelDef::CallableDef(def) = &ast.items[0].0 else {
+            panic!("expected callable def");
+        };
+        let Some((Expr::Call(outer), _)) = &def.body else {
+            panic!("expected outer vector update call");
+        };
+        assert!(matches!(
+            &outer.callee.0,
+            Expr::Ident(name) if name == "vector_update_subrange#"
+        ));
+        assert!(matches!(&outer.args[1].0, Expr::Literal(Literal::Number(ref n)) if n == "7"));
+        assert!(matches!(&outer.args[2].0, Expr::Literal(Literal::Number(ref n)) if n == "4"));
+        assert!(matches!(&outer.args[3].0, Expr::Ident(name) if name == "z"));
+
+        let Expr::Call(inner) = &outer.args[0].0 else {
+            panic!("expected nested vector update call");
+        };
+        assert!(matches!(
+            &inner.callee.0,
+            Expr::Ident(name) if name == "vector_update#"
+        ));
+        assert!(matches!(&inner.args[0].0, Expr::Ident(name) if name == "x"));
+        assert!(matches!(&inner.args[1].0, Expr::Literal(Literal::Number(ref n)) if n == "0"));
+        assert!(matches!(&inner.args[2].0, Expr::Ident(name) if name == "y"));
     }
 
     #[test]

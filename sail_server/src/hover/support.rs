@@ -125,12 +125,7 @@ pub(crate) fn infer_expr_type_text<'a>(
         Expr::Attribute { expr, .. }
         | Expr::Prefix { expr, .. }
         | Expr::Field { expr, .. }
-        | Expr::Index { expr, .. }
-        | Expr::Slice { expr, .. }
-        | Expr::Exit(Some(expr))
-        | Expr::VectorSlice { expr, .. } => {
-            infer_expr_type_text(files, current_uri, current_file, expr)
-        }
+        | Expr::Exit(Some(expr)) => infer_expr_type_text(files, current_uri, current_file, expr),
         Expr::Assert { .. } => Some("unit".to_string()),
         Expr::Exit(None) => None,
         Expr::Cast { ty, .. } => Some(span_text(current_file, ty.1)),

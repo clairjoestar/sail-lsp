@@ -362,10 +362,41 @@ pub struct LetBinding {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Lexp {
+    Attribute {
+        attr: Spanned<Attribute>,
+        lexp: Box<Spanned<Lexp>>,
+    },
+    Typed {
+        lexp: Box<Spanned<Lexp>>,
+        ty: Spanned<TypeExpr>,
+    },
+    Id(String),
+    Deref(Box<Spanned<Expr>>),
+    Call(Call),
+    Field {
+        lexp: Box<Spanned<Lexp>>,
+        field: Spanned<String>,
+    },
+    Vector {
+        lexp: Box<Spanned<Lexp>>,
+        index: Spanned<Expr>,
+    },
+    VectorRange {
+        lexp: Box<Spanned<Lexp>>,
+        start: Spanned<Expr>,
+        end: Spanned<Expr>,
+    },
+    VectorConcat(Vec<Spanned<Lexp>>),
+    Tuple(Vec<Spanned<Lexp>>),
+    Error(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BlockItem {
     Let(LetBinding),
     Var {
-        target: Spanned<Expr>,
+        target: Spanned<Lexp>,
         value: Spanned<Expr>,
     },
     Expr(Spanned<Expr>),
@@ -462,7 +493,7 @@ pub enum Expr {
         expr: Box<Spanned<Expr>>,
     },
     Assign {
-        lhs: Box<Spanned<Expr>>,
+        lhs: Box<Spanned<Lexp>>,
         rhs: Box<Spanned<Expr>>,
     },
     Let {
@@ -470,7 +501,7 @@ pub enum Expr {
         body: Box<Spanned<Expr>>,
     },
     Var {
-        target: Box<Spanned<Expr>>,
+        target: Box<Spanned<Lexp>>,
         value: Box<Spanned<Expr>>,
         body: Box<Spanned<Expr>>,
     },
@@ -528,24 +559,9 @@ pub enum Expr {
     Field {
         expr: Box<Spanned<Expr>>,
         field: Spanned<String>,
-        via_arrow: bool,
     },
     SizeOf(Spanned<TypeExpr>),
     Constraint(Spanned<TypeExpr>),
-    Index {
-        expr: Box<Spanned<Expr>>,
-        index: Box<Spanned<Expr>>,
-    },
-    Slice {
-        expr: Box<Spanned<Expr>>,
-        start: Box<Spanned<Expr>>,
-        end: Box<Spanned<Expr>>,
-    },
-    VectorSlice {
-        expr: Box<Spanned<Expr>>,
-        start: Box<Spanned<Expr>>,
-        length: Box<Spanned<Expr>>,
-    },
     Struct {
         name: Option<Spanned<String>>,
         fields: Vec<Spanned<FieldExpr>>,
@@ -556,10 +572,6 @@ pub enum Expr {
     },
     List(Vec<Spanned<Expr>>),
     Vector(Vec<Spanned<Expr>>),
-    VectorUpdate {
-        base: Box<Spanned<Expr>>,
-        updates: Vec<Spanned<VectorUpdate>>,
-    },
     Tuple(Vec<Spanned<Expr>>),
     Error(String),
 }
@@ -714,6 +726,148 @@ where
     U: for<'a> From<&'a T>,
 {
     Box::new(lower_spanned(value))
+}
+
+fn extend_vector_concat_lexps(
+    value: &parse_ast::Spanned<parse_ast::Expr>,
+    parts: &mut Vec<Spanned<Lexp>>,
+) {
+    if let parse_ast::Expr::Infix { lhs, op, rhs } = &value.0 {
+        if op.0 == "@" {
+            extend_vector_concat_lexps(lhs, parts);
+            extend_vector_concat_lexps(rhs, parts);
+            return;
+        }
+    }
+    parts.push(lower_lexp_spanned(value));
+}
+
+fn lower_lexp_inner(value: &parse_ast::Expr, span: Span) -> Lexp {
+    match value {
+        parse_ast::Expr::Attribute { attr, expr } => Lexp::Attribute {
+            attr: lower_spanned(attr),
+            lexp: Box::new(lower_lexp_spanned(expr)),
+        },
+        parse_ast::Expr::Cast { expr, ty } => Lexp::Typed {
+            lexp: Box::new(lower_lexp_spanned(expr)),
+            ty: lower_spanned(ty),
+        },
+        parse_ast::Expr::Ident(name) => Lexp::Id(name.clone()),
+        parse_ast::Expr::Call(call) => {
+            let callee_name = match &call.callee.0 {
+                parse_ast::Expr::Ident(name) => Some(name.as_str()),
+                _ => None,
+            };
+            match callee_name {
+                Some("vector_access#") if call.args.len() == 2 => Lexp::Vector {
+                    lexp: Box::new(lower_lexp_spanned(&call.args[0])),
+                    index: lower_expr_spanned(&call.args[1]),
+                },
+                Some("vector_subrange#") if call.args.len() == 3 => Lexp::VectorRange {
+                    lexp: Box::new(lower_lexp_spanned(&call.args[0])),
+                    start: lower_expr_spanned(&call.args[1]),
+                    end: lower_expr_spanned(&call.args[2]),
+                },
+                _ => Lexp::Call(Call::from(call)),
+            }
+        }
+        parse_ast::Expr::Field { expr, field, .. } => Lexp::Field {
+            lexp: Box::new(lower_lexp_spanned(expr)),
+            field: field.clone(),
+        },
+        parse_ast::Expr::Index { expr, index } => Lexp::Vector {
+            lexp: Box::new(lower_lexp_spanned(expr)),
+            index: lower_expr_spanned(index),
+        },
+        parse_ast::Expr::Slice { expr, start, end } => Lexp::VectorRange {
+            lexp: Box::new(lower_lexp_spanned(expr)),
+            start: lower_expr_spanned(start),
+            end: lower_expr_spanned(end),
+        },
+        parse_ast::Expr::Tuple(items) => {
+            Lexp::Tuple(items.iter().map(lower_lexp_spanned).collect())
+        }
+        parse_ast::Expr::Infix { op, .. } if op.0 == "@" => {
+            let mut parts = Vec::new();
+            extend_vector_concat_lexps(&(value.clone(), span), &mut parts);
+            Lexp::VectorConcat(parts)
+        }
+        parse_ast::Expr::Error(message) => Lexp::Error(message.clone()),
+        _ => Lexp::Error("unsupported l-expression".to_string()),
+    }
+}
+
+pub(crate) fn lower_lexp_spanned(value: &parse_ast::Spanned<parse_ast::Expr>) -> Spanned<Lexp> {
+    (lower_lexp_inner(&value.0, value.1), value.1)
+}
+
+fn synthetic_call_expr(
+    callee: impl Into<String>,
+    callee_span: Span,
+    args: Vec<Spanned<Expr>>,
+    open_span: Span,
+    close_span: Span,
+    arg_separator_spans: Vec<Span>,
+) -> Expr {
+    Expr::Call(Call {
+        callee: Box::new((Expr::Ident(callee.into()), callee_span)),
+        args,
+        open_span,
+        close_span,
+        arg_separator_spans,
+    })
+}
+
+fn lower_vector_update_chain(
+    base: &parse_ast::Spanned<parse_ast::Expr>,
+    updates: &[parse_ast::Spanned<parse_ast::VectorUpdate>],
+) -> Expr {
+    let mut lowered = lower_expr_spanned(base);
+    for update in updates {
+        let lowered_start = lowered.1.start;
+        let update_end = update.1.end.max(lowered.1.end);
+        let lowered_update = match &update.0 {
+            parse_ast::VectorUpdate::Assignment { target, value } => synthetic_call_expr(
+                "vector_update#",
+                update.1,
+                vec![
+                    lowered.clone(),
+                    lower_expr_spanned(target),
+                    lower_expr_spanned(value),
+                ],
+                update.1,
+                update.1,
+                Vec::new(),
+            ),
+            parse_ast::VectorUpdate::RangeAssignment { start, end, value } => synthetic_call_expr(
+                "vector_update_subrange#",
+                update.1,
+                vec![
+                    lowered.clone(),
+                    lower_expr_spanned(start),
+                    lower_expr_spanned(end),
+                    lower_expr_spanned(value),
+                ],
+                update.1,
+                update.1,
+                Vec::new(),
+            ),
+            parse_ast::VectorUpdate::Shorthand(name) => {
+                let ident = (Expr::Ident(name.0.clone()), name.1);
+                synthetic_call_expr(
+                    "vector_update#",
+                    update.1,
+                    vec![lowered.clone(), ident.clone(), ident],
+                    update.1,
+                    update.1,
+                    Vec::new(),
+                )
+            }
+        };
+        lowered = (lowered_update, Span::new(lowered_start, update_end));
+    }
+
+    lowered.0
 }
 
 impl From<&parse_ast::ScatteredKind> for ScatteredKind {
@@ -1197,7 +1351,7 @@ impl From<&parse_ast::BlockItem> for BlockItem {
         match value {
             parse_ast::BlockItem::Let(binding) => Self::Let(LetBinding::from(binding)),
             parse_ast::BlockItem::Var { target, value } => Self::Var {
-                target: lower_spanned(target),
+                target: lower_lexp_spanned(target),
                 value: lower_spanned(value),
             },
             parse_ast::BlockItem::Expr(expr) => Self::Expr(lower_spanned(expr)),
@@ -1326,7 +1480,7 @@ impl From<&parse_ast::Expr> for Expr {
                 expr: lower_boxed_spanned(expr),
             },
             parse_ast::Expr::Assign { lhs, rhs } => Self::Assign {
-                lhs: lower_boxed_spanned(lhs),
+                lhs: Box::new(lower_lexp_spanned(lhs)),
                 rhs: lower_boxed_spanned(rhs),
             },
             parse_ast::Expr::Let { binding, body } => Self::Let {
@@ -1338,7 +1492,7 @@ impl From<&parse_ast::Expr> for Expr {
                 value,
                 body,
             } => Self::Var {
-                target: lower_boxed_spanned(target),
+                target: Box::new(lower_lexp_spanned(target)),
                 value: lower_boxed_spanned(value),
                 body: lower_boxed_spanned(body),
             },
@@ -1407,35 +1561,48 @@ impl From<&parse_ast::Expr> for Expr {
             parse_ast::Expr::TypeVar(name) => Self::TypeVar(name.clone()),
             parse_ast::Expr::Ref(name) => Self::Ref(name.clone()),
             parse_ast::Expr::Call(call) => Self::Call(Call::from(call)),
-            parse_ast::Expr::Field {
-                expr,
-                field,
-                via_arrow,
-            } => Self::Field {
+            parse_ast::Expr::Field { expr, field, .. } => Self::Field {
                 expr: lower_boxed_spanned(expr),
                 field: field.clone(),
-                via_arrow: *via_arrow,
             },
             parse_ast::Expr::SizeOf(ty) => Self::SizeOf(lower_spanned(ty)),
             parse_ast::Expr::Constraint(ty) => Self::Constraint(lower_spanned(ty)),
-            parse_ast::Expr::Index { expr, index } => Self::Index {
-                expr: lower_boxed_spanned(expr),
-                index: lower_boxed_spanned(index),
-            },
-            parse_ast::Expr::Slice { expr, start, end } => Self::Slice {
-                expr: lower_boxed_spanned(expr),
-                start: lower_boxed_spanned(start),
-                end: lower_boxed_spanned(end),
-            },
+            parse_ast::Expr::Index { expr, index } => synthetic_call_expr(
+                "vector_access#",
+                index.1,
+                vec![lower_expr_spanned(expr), lower_expr_spanned(index)],
+                index.1,
+                index.1,
+                Vec::new(),
+            ),
+            parse_ast::Expr::Slice { expr, start, end } => synthetic_call_expr(
+                "vector_subrange#",
+                start.1,
+                vec![
+                    lower_expr_spanned(expr),
+                    lower_expr_spanned(start),
+                    lower_expr_spanned(end),
+                ],
+                start.1,
+                end.1,
+                Vec::new(),
+            ),
             parse_ast::Expr::VectorSlice {
                 expr,
                 start,
                 length,
-            } => Self::VectorSlice {
-                expr: lower_boxed_spanned(expr),
-                start: lower_boxed_spanned(start),
-                length: lower_boxed_spanned(length),
-            },
+            } => synthetic_call_expr(
+                "slice",
+                start.1,
+                vec![
+                    lower_expr_spanned(expr),
+                    lower_expr_spanned(start),
+                    lower_expr_spanned(length),
+                ],
+                start.1,
+                length.1,
+                Vec::new(),
+            ),
             parse_ast::Expr::Struct { name, fields } => Self::Struct {
                 name: name.clone(),
                 fields: lower_spanned_vec(fields),
@@ -1446,10 +1613,9 @@ impl From<&parse_ast::Expr> for Expr {
             },
             parse_ast::Expr::List(items) => Self::List(lower_spanned_vec(items)),
             parse_ast::Expr::Vector(items) => Self::Vector(lower_spanned_vec(items)),
-            parse_ast::Expr::VectorUpdate { base, updates } => Self::VectorUpdate {
-                base: lower_boxed_spanned(base),
-                updates: lower_spanned_vec(updates),
-            },
+            parse_ast::Expr::VectorUpdate { base, updates } => {
+                lower_vector_update_chain(base, updates)
+            }
             parse_ast::Expr::Tuple(items) => Self::Tuple(lower_spanned_vec(items)),
             parse_ast::Expr::Error(message) => Self::Error(message.clone()),
         }
@@ -1621,6 +1787,7 @@ fn lower_definition(
 
 #[cfg(test)]
 mod tests {
+    use crate::{ast as parse_ast, Span};
     use chumsky::Parser;
 
     #[test]
@@ -1659,5 +1826,132 @@ mod tests {
         let body = def.body.as_ref().expect("function body");
         assert!(matches!(body.0, super::Expr::If { .. }));
         assert!(matches!(def.params[0].0, super::Pattern::Typed(_, _)));
+    }
+
+    #[test]
+    fn canonicalizes_legacy_vector_nodes_into_builtin_calls() {
+        let span = Span::new(0, 1);
+        let expr = (
+            parse_ast::Expr::VectorUpdate {
+                base: Box::new((
+                    parse_ast::Expr::Slice {
+                        expr: Box::new((parse_ast::Expr::Ident("xs".to_string()), span)),
+                        start: Box::new((
+                            parse_ast::Expr::Literal(parse_ast::Literal::Number("7".to_string())),
+                            span,
+                        )),
+                        end: Box::new((
+                            parse_ast::Expr::Literal(parse_ast::Literal::Number("4".to_string())),
+                            span,
+                        )),
+                    },
+                    span,
+                )),
+                updates: vec![(
+                    parse_ast::VectorUpdate::Assignment {
+                        target: (parse_ast::Expr::Ident("bits".to_string()), span),
+                        value: (
+                            parse_ast::Expr::VectorSlice {
+                                expr: Box::new((parse_ast::Expr::Ident("ys".to_string()), span)),
+                                start: Box::new((
+                                    parse_ast::Expr::Literal(parse_ast::Literal::Number(
+                                        "2".to_string(),
+                                    )),
+                                    span,
+                                )),
+                                length: Box::new((
+                                    parse_ast::Expr::Literal(parse_ast::Literal::Number(
+                                        "3".to_string(),
+                                    )),
+                                    span,
+                                )),
+                            },
+                            span,
+                        ),
+                    },
+                    span,
+                )],
+            },
+            span,
+        );
+
+        let lowered = super::lower_expr_spanned(&expr);
+        let super::Expr::Call(outer) = lowered.0 else {
+            panic!("{lowered:#?}");
+        };
+        assert!(matches!(
+            &outer.callee.0,
+            super::Expr::Ident(name) if name == "vector_update#"
+        ));
+        let super::Expr::Call(base) = &outer.args[0].0 else {
+            panic!("{:#?}", outer.args[0]);
+        };
+        assert!(matches!(
+            &base.callee.0,
+            super::Expr::Ident(name) if name == "vector_subrange#"
+        ));
+        let super::Expr::Call(value) = &outer.args[2].0 else {
+            panic!("{:#?}", outer.args[2]);
+        };
+        assert!(matches!(
+            &value.callee.0,
+            super::Expr::Ident(name) if name == "slice"
+        ));
+    }
+
+    #[test]
+    fn lowers_assignment_targets_into_lexps() {
+        let span = Span::new(0, 1);
+        let ty = (parse_ast::TypeExpr::Named("int".to_string()), span);
+        let expr = (
+            parse_ast::Expr::Var {
+                target: Box::new((
+                    parse_ast::Expr::Cast {
+                        expr: Box::new((
+                            parse_ast::Expr::Call(parse_ast::Call {
+                                callee: Box::new((
+                                    parse_ast::Expr::Ident("vector_access#".to_string()),
+                                    span,
+                                )),
+                                args: vec![
+                                    (parse_ast::Expr::Ident("xs".to_string()), span),
+                                    (
+                                        parse_ast::Expr::Literal(parse_ast::Literal::Number(
+                                            "0".to_string(),
+                                        )),
+                                        span,
+                                    ),
+                                ],
+                                open_span: span,
+                                close_span: span,
+                                arg_separator_spans: Vec::new(),
+                            }),
+                            span,
+                        )),
+                        ty: ty.clone(),
+                    },
+                    span,
+                )),
+                value: Box::new((
+                    parse_ast::Expr::Literal(parse_ast::Literal::Number("1".to_string())),
+                    span,
+                )),
+                body: Box::new((parse_ast::Expr::Ident("done".to_string()), span)),
+            },
+            span,
+        );
+
+        let lowered = super::lower_expr_spanned(&expr);
+        let super::Expr::Var { target, .. } = lowered.0 else {
+            panic!("{lowered:#?}");
+        };
+        let super::Lexp::Typed { lexp, ty } = &target.0 else {
+            panic!("{target:#?}");
+        };
+        assert!(matches!(ty.0, super::TypeExpr::Named(ref name) if name == "int"));
+        assert!(matches!(
+            &lexp.0,
+            super::Lexp::Vector { lexp, .. } if matches!(lexp.0, super::Lexp::Id(ref name) if name == "xs")
+        ));
     }
 }

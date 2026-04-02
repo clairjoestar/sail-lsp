@@ -16,9 +16,9 @@ use sail_parser::{
         SourceFile, TerminationMeasureDefinition, TypeAliasDefinition,
     },
     AttributeData, BitfieldField, BlockItem, Call, CallableClause, CallableQuantifier,
-    EnumFunction, EnumMember, Expr, ExternSpec, FieldExpr, FieldPattern, LoopMeasure, MappingArm,
-    MappingBody, MatchCase, NamedDefDetail, Pattern, RecMeasure, Span, TerminationMeasureKind,
-    Token, TypeExpr, TypeParamSpec, UnionPayload, UnionVariant, VectorUpdate,
+    EnumFunction, EnumMember, Expr, ExternSpec, FieldExpr, FieldPattern, Lexp, LoopMeasure,
+    MappingArm, MappingBody, MatchCase, NamedDefDetail, Pattern, RecMeasure, Span,
+    TerminationMeasureKind, Token, TypeExpr, TypeParamSpec, UnionPayload, UnionVariant,
 };
 pub(crate) fn compute_parse_diagnostics(
     file: &File,
@@ -464,7 +464,11 @@ impl<'a> ParseDiagnosticCollector<'a> {
                 self.collect_attribute_warnings(&attr.0.parsed_data);
                 self.collect_expr_warnings(expr);
             }
-            Expr::Assign { lhs, rhs } | Expr::Infix { lhs, rhs, .. } => {
+            Expr::Assign { lhs, rhs } => {
+                self.collect_lexp_warnings(lhs);
+                self.collect_expr_warnings(rhs);
+            }
+            Expr::Infix { lhs, rhs, .. } => {
                 self.collect_expr_warnings(lhs);
                 self.collect_expr_warnings(rhs);
             }
@@ -478,7 +482,7 @@ impl<'a> ParseDiagnosticCollector<'a> {
                 value,
                 body,
             } => {
-                self.collect_expr_warnings(target);
+                self.collect_lexp_warnings(target);
                 self.collect_expr_warnings(value);
                 self.collect_expr_warnings(body);
             }
@@ -573,24 +577,6 @@ impl<'a> ParseDiagnosticCollector<'a> {
                 }
             }
             Expr::SizeOf(ty) | Expr::Constraint(ty) => self.collect_type_warnings(ty),
-            Expr::Index { expr, index } => {
-                self.collect_expr_warnings(expr);
-                self.collect_expr_warnings(index);
-            }
-            Expr::Slice { expr, start, end } => {
-                self.collect_expr_warnings(expr);
-                self.collect_expr_warnings(start);
-                self.collect_expr_warnings(end);
-            }
-            Expr::VectorSlice {
-                expr,
-                start,
-                length,
-            } => {
-                self.collect_expr_warnings(expr);
-                self.collect_expr_warnings(start);
-                self.collect_expr_warnings(length);
-            }
             Expr::Struct { fields, .. } => {
                 for field in fields {
                     self.collect_field_expr_warnings(&field.0);
@@ -605,12 +591,6 @@ impl<'a> ParseDiagnosticCollector<'a> {
             Expr::List(items) | Expr::Vector(items) | Expr::Tuple(items) => {
                 for item in items {
                     self.collect_expr_warnings(item);
-                }
-            }
-            Expr::VectorUpdate { base, updates } => {
-                self.collect_expr_warnings(base);
-                for update in updates {
-                    self.collect_vector_update_warnings(&update.0);
                 }
             }
             Expr::Config(_)
@@ -629,10 +609,46 @@ impl<'a> ParseDiagnosticCollector<'a> {
                 self.collect_expr_warnings(&binding.value);
             }
             BlockItem::Var { target, value } => {
-                self.collect_expr_warnings(target);
+                self.collect_lexp_warnings(target);
                 self.collect_expr_warnings(value);
             }
             BlockItem::Expr(expr) => self.collect_expr_warnings(expr),
+        }
+    }
+
+    fn collect_lexp_warnings(&mut self, lexp: &(Lexp, Span)) {
+        match &lexp.0 {
+            Lexp::Attribute { attr, lexp } => {
+                self.collect_attribute_warnings(&attr.0.parsed_data);
+                self.collect_lexp_warnings(lexp);
+            }
+            Lexp::Typed { lexp, ty } => {
+                self.collect_lexp_warnings(lexp);
+                self.collect_type_warnings(ty);
+            }
+            Lexp::Deref(expr) => self.collect_expr_warnings(expr),
+            Lexp::Call(Call { callee, args, .. }) => {
+                self.collect_expr_warnings(callee);
+                for arg in args {
+                    self.collect_expr_warnings(arg);
+                }
+            }
+            Lexp::Field { lexp, .. } => self.collect_lexp_warnings(lexp),
+            Lexp::Vector { lexp, index } => {
+                self.collect_lexp_warnings(lexp);
+                self.collect_expr_warnings(index);
+            }
+            Lexp::VectorRange { lexp, start, end } => {
+                self.collect_lexp_warnings(lexp);
+                self.collect_expr_warnings(start);
+                self.collect_expr_warnings(end);
+            }
+            Lexp::VectorConcat(items) | Lexp::Tuple(items) => {
+                for item in items {
+                    self.collect_lexp_warnings(item);
+                }
+            }
+            Lexp::Id(_) | Lexp::Error(_) => {}
         }
     }
 
@@ -671,21 +687,6 @@ impl<'a> ParseDiagnosticCollector<'a> {
                 self.collect_expr_warnings(value);
             }
             FieldExpr::Shorthand(_) => {}
-        }
-    }
-
-    fn collect_vector_update_warnings(&mut self, update: &VectorUpdate) {
-        match update {
-            VectorUpdate::Assignment { target, value } => {
-                self.collect_expr_warnings(target);
-                self.collect_expr_warnings(value);
-            }
-            VectorUpdate::RangeAssignment { start, end, value } => {
-                self.collect_expr_warnings(start);
-                self.collect_expr_warnings(end);
-                self.collect_expr_warnings(value);
-            }
-            VectorUpdate::Shorthand(_) => {}
         }
     }
 

@@ -9,7 +9,7 @@ pub use core_ast::{
     Attribute, AttributeData, AttributeEntry, BitfieldField, BlockItem, Call, CallableClause,
     CallableDefKind, CallableQuantifier, CallableSpecKind, DefModifiers, EnumFunction, EnumMember,
     Expr, ExternBinding, ExternPurity, ExternSpec, FieldExpr, FieldPattern, FixityKind,
-    ForeachExpr, InstantiationSubstitution, LetBinding, Literal, LoopMeasure, MappingArm,
+    ForeachExpr, InstantiationSubstitution, LetBinding, Lexp, Literal, LoopMeasure, MappingArm,
     MappingArmDirection, MappingBody, MatchCase, NamedDefDetail, NamedDefKind, Pattern,
     QuantifierVar, RecMeasure, ScatteredClauseKind, ScatteredKind, Spanned, TerminationMeasureKind,
     TypeArrowKind, TypeExpr, TypeParam, TypeParamSpec, TypeParamTail, TypedField, UnionPayload,

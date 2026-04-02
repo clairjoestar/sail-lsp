@@ -242,6 +242,739 @@ fn reports_mismatched_arg_count_from_typecheck() {
 }
 
 #[test]
+fn reports_missing_record_fields_from_typecheck() {
+    let source = "struct S = { x : int, y : bool }\nfunction f() = { struct S { x = 1 } }\n";
+    let file = File::new(source.to_string());
+    let diagnostics = file.lsp_diagnostics();
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic_code_str(diagnostic) == Some("type-error")
+                && diagnostic
+                    .message
+                    .contains("struct literal missing fields: y")
+        })
+        .expect("missing record field diagnostic");
+
+    assert_eq!(
+        diagnostic.severity,
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+    );
+}
+
+#[test]
+fn reports_record_field_type_errors_from_typecheck() {
+    let source = "struct S = { x : int }\nfunction f() = { struct S { x = true } }\n";
+    let file = File::new(source.to_string());
+    let diagnostics = file.lsp_diagnostics();
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic_code_str(diagnostic) == Some("type-error")
+                && diagnostic.message.contains("bool")
+                && diagnostic.message.contains("int")
+        })
+        .expect("missing record field type diagnostic");
+
+    assert_eq!(
+        diagnostic.severity,
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+    );
+}
+
+#[test]
+fn reports_record_update_field_type_errors_from_typecheck() {
+    let source =
+        "struct S = { x : int }\nlet s : S = struct S { x = 1 }\nlet _ = { s with x = true }\n";
+    let file = File::new(source.to_string());
+    let diagnostics = file.lsp_diagnostics();
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic_code_str(diagnostic) == Some("type-error")
+                && diagnostic.message.contains("bool")
+                && diagnostic.message.contains("int")
+        })
+        .expect("missing record update diagnostic");
+
+    assert_eq!(
+        diagnostic.severity,
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+    );
+}
+
+#[test]
+fn applies_record_type_arguments_to_field_types() {
+    let source = "struct pair('a) = { fst : 'a, snd : 'a }\nfunction f(p : pair(int)) = { let x : bool = p.fst; x }\n";
+    let file = File::new(source.to_string());
+    let diagnostics = file.lsp_diagnostics();
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic_code_str(diagnostic) == Some("type-error")
+                && diagnostic.message.contains("int")
+                && diagnostic.message.contains("bool")
+        })
+        .expect("missing instantiated record field diagnostic");
+
+    assert_eq!(
+        diagnostic.severity,
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+    );
+}
+
+#[test]
+fn applies_expected_record_type_to_generic_struct_literals() {
+    let source = "struct pair('a) = { fst : 'a, snd : 'a }\nfunction mk() -> pair(int) = { struct pair { fst = 1, snd = true } }\n";
+    let file = File::new(source.to_string());
+    let diagnostics = file.lsp_diagnostics();
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic_code_str(diagnostic) == Some("type-error")
+                && diagnostic.message.contains("bool")
+                && diagnostic.message.contains("int")
+        })
+        .expect("missing generic struct literal diagnostic");
+
+    assert_eq!(
+        diagnostic.severity,
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+    );
+}
+
+#[test]
+fn reports_list_element_type_errors_against_expected_return_type() {
+    let source = "function f() -> list(bool) = [|true, 1|]\n";
+    let file = File::new(source.to_string());
+    let diagnostics = file.lsp_diagnostics();
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic_code_str(diagnostic) == Some("type-error")
+                && diagnostic.message.contains("int")
+                && diagnostic.message.contains("bool")
+        })
+        .expect("missing list element type diagnostic");
+
+    assert_eq!(
+        diagnostic.severity,
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+    );
+}
+
+#[test]
+fn reports_tuple_element_type_errors_against_expected_return_type() {
+    let source = "function f() -> (int, bool) = (1, 2)\n";
+    let file = File::new(source.to_string());
+    let diagnostics = file.lsp_diagnostics();
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic_code_str(diagnostic) == Some("type-error")
+                && diagnostic.message.contains("int")
+                && diagnostic.message.contains("bool")
+        })
+        .expect("missing tuple element type diagnostic");
+
+    assert_eq!(
+        diagnostic.severity,
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+    );
+}
+
+#[test]
+fn reports_vector_length_errors_against_expected_return_type() {
+    let source = "function f() -> vector(2, bool) = [true, false, true]\n";
+    let file = File::new(source.to_string());
+    let diagnostics = file.lsp_diagnostics();
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic_code_str(diagnostic) == Some("type-error")
+                && diagnostic.message.contains("vector(3")
+                && diagnostic.message.contains("vector(2, bool)")
+        })
+        .expect("missing vector length diagnostic");
+
+    assert_eq!(
+        diagnostic.severity,
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+    );
+}
+
+#[test]
+fn binds_union_constructor_pattern_payload_types() {
+    let source = "union opt('a) = { None : unit, Some : 'a }\nfunction f(x : opt(int)) = match x { Some(v) => if v then () else (), None() => () }\n";
+    let file = File::new(source.to_string());
+    let diagnostics = file.lsp_diagnostics();
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic_code_str(diagnostic) == Some("type-error")
+                && diagnostic.message.contains("int")
+                && diagnostic.message.contains("bool")
+        })
+        .expect("missing constructor payload type diagnostic");
+
+    assert_eq!(
+        diagnostic.severity,
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+    );
+    assert!(diagnostics
+        .iter()
+        .all(|diagnostic| !diagnostic.message.contains("Identifier v is unbound")));
+}
+
+#[test]
+fn checks_match_case_bodies_against_expected_return_type() {
+    let source = "union opt('a) = { None : unit, Some : 'a }\nfunction f(x : opt(int)) -> bool = match x { Some(v) => v, None() => false }\n";
+    let file = File::new(source.to_string());
+    let diagnostics = file.lsp_diagnostics();
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic_code_str(diagnostic) == Some("type-error")
+                && diagnostic.message.contains("int")
+                && diagnostic.message.contains("bool")
+        })
+        .expect("missing match branch expected type diagnostic");
+
+    assert_eq!(
+        diagnostic.severity,
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+    );
+}
+
+#[test]
+fn typechecks_union_constructor_calls_as_expressions() {
+    let source =
+        "union opt('a) = { None : unit, Some : 'a }\nfunction f() -> opt(int) = Some(true)\n";
+    let file = File::new(source.to_string());
+    let diagnostics = file.lsp_diagnostics();
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic_code_str(diagnostic) == Some("type-error")
+                && diagnostic.message.contains("bool")
+                && diagnostic.message.contains("int")
+        })
+        .expect("missing constructor call type diagnostic");
+
+    assert_eq!(
+        diagnostic.severity,
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+    );
+}
+
+#[test]
+fn checks_annotated_local_list_bindings_with_expected_type() {
+    let source = "function f() = { let xs : list(bool) = [|true, 1|]; () }\n";
+    let file = File::new(source.to_string());
+    let diagnostics = file.lsp_diagnostics();
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic_code_str(diagnostic) == Some("type-error")
+                && diagnostic.message.contains("int")
+                && diagnostic.message.contains("bool")
+        })
+        .expect("missing annotated let type diagnostic");
+
+    assert_eq!(
+        diagnostic.severity,
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+    );
+}
+
+#[test]
+fn reports_struct_pattern_missing_fields_from_typecheck() {
+    let source =
+        "struct S = { x : int, y : bool }\nfunction f(s : S) = match s { struct S { x } => () }\n";
+    let file = File::new(source.to_string());
+    let diagnostics = file.lsp_diagnostics();
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic_code_str(diagnostic) == Some("type-error")
+                && diagnostic
+                    .message
+                    .contains("struct pattern missing fields: y")
+        })
+        .expect("missing struct pattern field diagnostic");
+
+    assert_eq!(
+        diagnostic.severity,
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+    );
+}
+
+#[test]
+fn does_not_report_missing_fields_for_struct_pattern_wildcard() {
+    let source = "struct S = { x : int, y : bool }\nfunction f(s : S) = match s { struct S { x, _ } => x }\n";
+    let file = File::new(source.to_string());
+    let diagnostics = file.lsp_diagnostics();
+
+    assert!(diagnostics
+        .iter()
+        .all(|diagnostic| !diagnostic.message.contains("struct pattern missing fields")));
+}
+
+#[test]
+fn reports_duplicate_pattern_bindings_from_typecheck() {
+    let source = "function f(xs : list(int)) = match xs { x :: x => x, [||] => 0 }\n";
+    let file = File::new(source.to_string());
+    let diagnostics = file.lsp_diagnostics();
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic_code_str(diagnostic) == Some("type-error")
+                && diagnostic
+                    .message
+                    .contains("Duplicate binding for x in pattern")
+        })
+        .expect("missing duplicate pattern diagnostic");
+
+    assert_eq!(
+        diagnostic.severity,
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+    );
+}
+
+#[test]
+fn binds_vector_subrange_patterns_like_upstream() {
+    let source = "default Order dec\nfunction f(x : bits(8)) = match x { flag[7 .. 4] @ flag[3 .. 0] => if flag then () else () }\n";
+    let file = File::new(source.to_string());
+    let diagnostics = file.lsp_diagnostics();
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic_code_str(diagnostic) == Some("type-error")
+                && diagnostic.message.contains("bits(8)")
+                && diagnostic.message.contains("bool")
+        })
+        .expect("missing vector subrange binding diagnostic");
+
+    assert_eq!(
+        diagnostic.severity,
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+    );
+    assert!(diagnostics
+        .iter()
+        .all(|diagnostic| !diagnostic.message.contains("Identifier flag is unbound")));
+}
+
+#[test]
+fn reports_non_contiguous_vector_subrange_patterns() {
+    let source = "default Order dec\nfunction f(x : bits(8)) = match x { flag[7 .. 4] @ flag[2 .. 0] => (), _ => () }\n";
+    let file = File::new(source.to_string());
+    let diagnostics = file.lsp_diagnostics();
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic_code_str(diagnostic) == Some("type-error")
+                && diagnostic
+                    .message
+                    .contains("pattern subranges are non-contiguous")
+        })
+        .expect("missing non-contiguous subrange diagnostic");
+
+    assert_eq!(
+        diagnostic.severity,
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+    );
+}
+
+#[test]
+fn typechecks_mapping_calls_as_expressions() {
+    let source = "enum width = BYTE | DOUBLE\nmapping size_bits : width <-> bits(2) = { BYTE <-> 0b00, DOUBLE <-> 0b11 }\nfunction f() -> bits(2) = size_bits(BYTE)\nfunction g() -> width = size_bits(0b11)\n";
+    let file = File::new(source.to_string());
+    let diagnostics = file.lsp_diagnostics();
+
+    assert!(diagnostics
+        .iter()
+        .all(|diagnostic| diagnostic_code_str(diagnostic) != Some("type-error")));
+}
+
+#[test]
+fn binds_mapping_pattern_payload_types() {
+    let source = "enum width = BYTE | DOUBLE\nmapping size_bits : width <-> bits(2) = { BYTE <-> 0b00, DOUBLE <-> 0b11 }\nfunction f(x : width) = match x { size_bits(bits) => if bits then () else () }\n";
+    let file = File::new(source.to_string());
+    let diagnostics = file.lsp_diagnostics();
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic_code_str(diagnostic) == Some("type-error")
+                && diagnostic.message.contains("bits(2)")
+                && diagnostic.message.contains("bool")
+        })
+        .expect("missing mapping pattern payload diagnostic");
+
+    assert_eq!(
+        diagnostic.severity,
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+    );
+    assert!(diagnostics
+        .iter()
+        .all(|diagnostic| !diagnostic.message.contains("Identifier bits is unbound")));
+}
+
+#[test]
+fn checks_mapping_guards_with_pattern_bindings() {
+    let source = "enum width = BYTE | DOUBLE\nval decode : bits(2) -> width\nmapping size_bits : width <-> bits(2) = { backwards bits if bits => decode(bits) }\n";
+    let file = File::new(source.to_string());
+    let diagnostics = file.lsp_diagnostics();
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic_code_str(diagnostic) == Some("type-error")
+                && diagnostic.message.contains("bits(2)")
+                && diagnostic.message.contains("bool")
+        })
+        .expect("missing mapping guard diagnostic");
+
+    assert_eq!(
+        diagnostic.severity,
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+    );
+    assert!(diagnostics
+        .iter()
+        .all(|diagnostic| !diagnostic.message.contains("Identifier bits is unbound")));
+}
+
+#[test]
+fn reports_bidirectional_mapping_binding_mismatches() {
+    let source = "mapping same : bits(2) <-> bits(2) = { left <-> right }\n";
+    let file = File::new(source.to_string());
+    let diagnostics = file.lsp_diagnostics();
+
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic_code_str(diagnostic) == Some("type-error")
+            && diagnostic
+                .message
+                .contains("Identifier left found on left hand side of mapping, but not on right")
+    }));
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic_code_str(diagnostic) == Some("type-error")
+            && diagnostic
+                .message
+                .contains("Identifier right found on right hand side of mapping, but not on left")
+    }));
+}
+
+#[test]
+fn reports_unresolved_quants_from_generic_call_without_context() {
+    let source = "val zeroes : forall 'n. unit -> bits('n)\nfunction use() = zeroes(())\n";
+    let file = File::new(source.to_string());
+    let diagnostics = file.lsp_diagnostics();
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic_code_str(diagnostic) == Some("type-error")
+                && diagnostic
+                    .message
+                    .contains("Could not resolve quantifiers for zeroes")
+        })
+        .expect("missing unresolved quantifier diagnostic");
+
+    assert_eq!(
+        diagnostic.severity,
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+    );
+}
+
+#[test]
+fn reports_failed_constraints_from_generic_call() {
+    let source =
+        "val widen : forall 'n, 'n in {1, 2}. unit -> bits(8 * 'n)\nfunction use() -> bits(24) = widen(())\n";
+    let file = File::new(source.to_string());
+    let diagnostics = file.lsp_diagnostics();
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic_code_str(diagnostic) == Some("type-error")
+                && diagnostic.message.contains("Failed to prove constraint")
+                && diagnostic.message.contains("'n in {1, 2}")
+        })
+        .expect("missing failed constraint diagnostic");
+
+    assert_eq!(
+        diagnostic.severity,
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+    );
+}
+
+#[test]
+fn infers_slice_result_types_for_bits() {
+    let source = "default Order dec\nfunction hi(x : bits(8)) -> bits(4) = x[7 .. 4]\n";
+    let file = File::new(source.to_string());
+    let diagnostics = file.lsp_diagnostics();
+
+    assert!(diagnostics
+        .iter()
+        .all(|diagnostic| diagnostic_code_str(diagnostic) != Some("type-error")));
+}
+
+#[test]
+fn typechecks_comma_slice_sugar_via_builtin_slice() {
+    let source = "function mid(x : bits(8)) -> bits(3) = x[2, 3]\n";
+    let file = File::new(source.to_string());
+    let diagnostics = file.lsp_diagnostics();
+
+    assert!(diagnostics
+        .iter()
+        .all(|diagnostic| diagnostic_code_str(diagnostic) != Some("type-error")));
+}
+
+#[test]
+fn reports_out_of_bounds_bit_index_access() {
+    let source = "function bit_at(x : bits(8)) -> bit = x[8]\n";
+    let file = File::new(source.to_string());
+    let diagnostics = file.lsp_diagnostics();
+
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic_code_str(diagnostic) == Some("type-error")
+            && diagnostic.message.contains("Failed to prove constraint")
+            && diagnostic.message.contains("0 <= 8 < 8")
+    }));
+}
+
+#[test]
+fn reports_vector_update_range_value_type_mismatch() {
+    let source =
+        "default Order dec\nfunction patch(x : bits(8)) -> bits(8) = [x with 7 .. 4 = 0b101]\n";
+    let file = File::new(source.to_string());
+    let diagnostics = file.lsp_diagnostics();
+
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic_code_str(diagnostic) == Some("type-error")
+            && diagnostic.message.contains("bits(3)")
+            && diagnostic.message.contains("bits(4)")
+    }));
+}
+
+#[test]
+fn treats_ref_register_as_register_typed_expression() {
+    let source = "val reg_deref : forall ('a : Type). register('a) -> 'a\nregister R : bits(8)\nfunction read() -> bits(8) = reg_deref(ref R)\n";
+    let file = File::new(source.to_string());
+    let diagnostics = file.lsp_diagnostics();
+
+    assert!(diagnostics
+        .iter()
+        .all(|diagnostic| diagnostic_code_str(diagnostic) != Some("type-error")));
+}
+
+#[test]
+fn infers_bitfield_access_and_updates() {
+    let source = "bitfield B : bits(8) = { HI : 7 .. 4, LO : 3 }\nregister R : B\nfunction hi() -> bits(4) = R[HI]\nfunction lo() -> bit = R.LO\nfunction bits() -> bits(8) = R.bits\nfunction patch() -> B = [R with HI = 0b1010]\nfunction write() = { R[HI] = 0b0001; () }\n";
+    let file = File::new(source.to_string());
+    let diagnostics = file.lsp_diagnostics();
+
+    assert!(diagnostics
+        .iter()
+        .all(|diagnostic| diagnostic_code_str(diagnostic) != Some("type-error")));
+}
+
+#[test]
+fn infers_concat_bitfield_ranges_like_upstream() {
+    let source = "bitfield B : bits(32) = { Field0 : (31 .. 16 @ 7 .. 0), Field1 : 15 .. 8 }\nregister R : B\nfunction get0() -> bits(24) = R[Field0]\nfunction get1() -> bits(8) = R[Field1]\nfunction patch() -> B = [R with Field1 = 0x47, Field0 = 0x000011]\nfunction write() = { R[Field0] = 0x4711FF; () }\n";
+    let file = File::new(source.to_string());
+    let diagnostics = file.lsp_diagnostics();
+
+    assert!(diagnostics
+        .iter()
+        .all(|diagnostic| diagnostic_code_str(diagnostic) != Some("type-error")));
+}
+
+#[test]
+fn supports_arrow_modifier_calls_for_register_overloads() {
+    let source = "val _get_hi : register(bits(8)) -> bits(4)\nval _set_hi : (register(bits(8)), bits(4)) -> unit\noverload _mod_hi = {_get_hi, _set_hi}\nregister R : bits(8)\nfunction read() -> bits(4) = R->hi()\nfunction write() = { R->hi() = 0b1010; () }\n";
+    let file = File::new(source.to_string());
+    let diagnostics = file.lsp_diagnostics();
+
+    assert!(diagnostics
+        .iter()
+        .all(|diagnostic| diagnostic_code_str(diagnostic) != Some("type-error")));
+}
+
+#[test]
+fn uses_expected_return_to_resolve_generic_call_quantifiers() {
+    let source =
+        "val zeroes : forall 'n. unit -> bits('n)\nfunction use() -> bits(8) = zeroes(())\n";
+    let file = File::new(source.to_string());
+    let diagnostics = file.lsp_diagnostics();
+
+    assert!(diagnostics
+        .iter()
+        .all(|diagnostic| diagnostic_code_str(diagnostic) != Some("type-error")));
+}
+
+#[test]
+fn solves_linear_numeric_quants_from_expected_return_type() {
+    let source =
+        "val widen : forall 'n. unit -> bits(8 * 'n)\nfunction use() -> bits(16) = widen(())\n";
+    let file = File::new(source.to_string());
+    let diagnostics = file.lsp_diagnostics();
+
+    assert!(diagnostics
+        .iter()
+        .all(|diagnostic| diagnostic_code_str(diagnostic) != Some("type-error")));
+}
+
+#[test]
+fn reports_unresolved_quants_for_unproved_symbolic_constraints() {
+    let source = "val take_width : forall 'n, 0 < 'n <= max_mem_access . bits('n) -> unit\nfunction use() = take_width(0b10101010)\n";
+    let file = File::new(source.to_string());
+    let diagnostics = file.lsp_diagnostics();
+
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic_code_str(diagnostic) == Some("type-error")
+            && diagnostic.message.contains("0 < 'n <= max_mem_access")
+    }));
+}
+
+#[test]
+fn resolves_quant_constraints_via_global_constraint_definitions() {
+    let source = "type max_mem_access : Int\nconstraint max_mem_access == 8\nval take_width : forall 'n, 0 < 'n <= max_mem_access . bits('n) -> unit\nfunction use() = take_width(0b10101010)\n";
+    let file = File::new(source.to_string());
+    let diagnostics = file.lsp_diagnostics();
+
+    assert!(diagnostics
+        .iter()
+        .all(|diagnostic| diagnostic_code_str(diagnostic) != Some("type-error")));
+}
+
+#[test]
+fn propagates_assert_constraints_to_following_calls() {
+    let source = "let max_mem_access : int = 8\nval take_width : forall 'n, 0 < 'n <= max_mem_access . bits('n) -> unit\nfunction use() = { assert(max_mem_access == 8, \"ok\"); take_width(0b10101010) }\n";
+    let file = File::new(source.to_string());
+    let diagnostics = file.lsp_diagnostics();
+
+    assert!(diagnostics
+        .iter()
+        .all(|diagnostic| diagnostic_code_str(diagnostic) != Some("type-error")));
+}
+
+#[test]
+fn resolves_quant_constraints_from_matching_global_assumptions() {
+    let source = "type xlen : Int\nconstraint xlen in {32, 64}\nval take_width : forall 'n, 'n in {32, 64} . bits('n) -> unit\nfunction use(xs : bits(xlen)) = take_width(xs)\n";
+    let file = File::new(source.to_string());
+    let diagnostics = file.lsp_diagnostics();
+
+    assert!(diagnostics
+        .iter()
+        .all(|diagnostic| diagnostic_code_str(diagnostic) != Some("type-error")));
+}
+
+#[test]
+fn resolves_weaker_quant_bounds_from_global_set_constraints() {
+    let source = "type xlen : Int\nconstraint xlen in {32, 64}\nval take_width : forall 'n, 1 <= 'n <= 64 . bits('n) -> unit\nfunction use(xs : bits(xlen)) = take_width(xs)\n";
+    let file = File::new(source.to_string());
+    let diagnostics = file.lsp_diagnostics();
+
+    assert!(diagnostics
+        .iter()
+        .all(|diagnostic| diagnostic_code_str(diagnostic) != Some("type-error")));
+}
+
+#[test]
+fn reports_inconsistent_global_constraints() {
+    let source = "type xlen : Int\nconstraint xlen == 32\nconstraint xlen == 64\n";
+    let file = File::new(source.to_string());
+    let diagnostics = file.lsp_diagnostics();
+
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic_code_str(diagnostic) == Some("type-error")
+            && diagnostic
+                .message
+                .contains("Global constraint appears inconsistent with previous global constraints")
+    }));
+}
+
+#[test]
+fn reports_literal_pattern_type_mismatches() {
+    let source = "function f(x : string) = match x { 1 => (), _ => () }\n";
+    let file = File::new(source.to_string());
+    let diagnostics = file.lsp_diagnostics();
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic_code_str(diagnostic) == Some("type-error")
+                && diagnostic.message.contains("int")
+                && diagnostic.message.contains("string")
+        })
+        .expect("missing literal pattern mismatch diagnostic");
+
+    assert_eq!(
+        diagnostic.severity,
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+    );
+}
+
+#[test]
+fn infers_callable_head_param_types_from_literal_patterns() {
+    let source = "function pick((1, x : int)) -> int = x\nfunction use() = pick((true, 0))\n";
+    let file = File::new(source.to_string());
+    let diagnostics = file.lsp_diagnostics();
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic_code_str(diagnostic) == Some("type-error")
+                && diagnostic.message.contains("bool")
+                && diagnostic.message.contains("int")
+        })
+        .expect("missing inferred callable head type diagnostic");
+
+    assert_eq!(
+        diagnostic.severity,
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+    );
+}
+
+#[test]
+fn reports_non_int_index_from_typecheck() {
+    let source = "function f() = { let v = [1, 2]; v[true] }\n";
+    let file = File::new(source.to_string());
+    let diagnostics = file.lsp_diagnostics();
+    let diagnostic = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic_code_str(diagnostic) == Some("type-error")
+                && diagnostic.message.contains("bool")
+                && diagnostic.message.contains("int")
+        })
+        .expect("missing index diagnostic");
+
+    assert_eq!(
+        diagnostic.severity,
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+    );
+}
+
+#[test]
+fn binds_foreach_iterators_for_typecheck() {
+    let source = "function f(n : int) = { foreach (i from 0 to n) { if i then () else () }; () }\n";
+    let file = File::new(source.to_string());
+    let diagnostics = file.lsp_diagnostics();
+    let bool_mismatch = diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic_code_str(diagnostic) == Some("type-error")
+                && diagnostic.message.contains("int")
+                && diagnostic.message.contains("bool")
+        })
+        .expect("missing foreach iterator type diagnostic");
+
+    assert_eq!(
+        bool_mismatch.severity,
+        Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
+    );
+    assert!(diagnostics
+        .iter()
+        .all(|diagnostic| !diagnostic.message.contains("Identifier i is unbound")));
+}
+
+#[test]
 fn warns_on_upstream_deprecated_effect_annotations() {
     let source = "val write_ram : unit -> bool effect {wmv}\n";
     let file = File::new(source.to_string());

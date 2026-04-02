@@ -10,8 +10,8 @@ use crate::state::File;
 use sail_parser::{
     core_ast::{DefinitionKind as CoreDefinitionKind, SourceFile as CoreSourceFile},
     BlockItem as AstBlockItem, Expr as AstExpr, FieldExpr as AstFieldExpr,
-    FieldPattern as AstFieldPattern, MatchCase as AstMatchCase, Pattern as AstPattern,
-    VectorUpdate as AstVectorUpdate,
+    FieldPattern as AstFieldPattern, Lexp as AstLexp, MatchCase as AstMatchCase,
+    Pattern as AstPattern,
 };
 
 #[derive(Debug)]
@@ -213,9 +213,8 @@ impl<'a> AstSemanticAnalyzer<'a> {
             | AstExpr::Prefix { expr, .. }
             | AstExpr::Cast { expr, .. }
             | AstExpr::Field { expr, .. } => self.analyze_expr(expr),
-            AstExpr::Assign { lhs, rhs } | AstExpr::Infix { lhs, rhs, .. } => {
-                self.analyze_expr(lhs) || self.analyze_expr(rhs)
-            }
+            AstExpr::Assign { lhs, rhs } => self.analyze_lexp(lhs) || self.analyze_expr(rhs),
+            AstExpr::Infix { lhs, rhs, .. } => self.analyze_expr(lhs) || self.analyze_expr(rhs),
             AstExpr::Let { binding, body } => self.analyze_let_expr(binding, body),
             AstExpr::Var {
                 target,
@@ -277,15 +276,6 @@ impl<'a> AstSemanticAnalyzer<'a> {
                 }
                 terminates
             }
-            AstExpr::Index { expr, index } => self.analyze_expr(expr) || self.analyze_expr(index),
-            AstExpr::Slice { expr, start, end } => {
-                self.analyze_expr(expr) || self.analyze_expr(start) || self.analyze_expr(end)
-            }
-            AstExpr::VectorSlice {
-                expr,
-                start,
-                length,
-            } => self.analyze_expr(expr) || self.analyze_expr(start) || self.analyze_expr(length),
             AstExpr::Struct { fields, .. } => {
                 let mut terminates = false;
                 for field in fields {
@@ -304,13 +294,6 @@ impl<'a> AstSemanticAnalyzer<'a> {
                 let mut terminates = false;
                 for item in items {
                     terminates |= self.analyze_expr(item);
-                }
-                terminates
-            }
-            AstExpr::VectorUpdate { base, updates } => {
-                let mut terminates = self.analyze_expr(base);
-                for update in updates {
-                    terminates |= self.analyze_vector_update(update);
                 }
                 terminates
             }
@@ -348,6 +331,7 @@ impl<'a> AstSemanticAnalyzer<'a> {
                 AstBlockItem::Var { target, value } => {
                     let value_terminates = self.analyze_expr(value);
                     if !value_terminates {
+                        self.analyze_decl_target(target);
                         self.define_target_binding(target, true);
                     }
                     value_terminates
@@ -384,7 +368,7 @@ impl<'a> AstSemanticAnalyzer<'a> {
 
     fn analyze_var_expr(
         &mut self,
-        target: &(AstExpr, sail_parser::Span),
+        target: &(AstLexp, sail_parser::Span),
         value: &(AstExpr, sail_parser::Span),
         body: &(AstExpr, sail_parser::Span),
     ) -> bool {
@@ -395,10 +379,54 @@ impl<'a> AstSemanticAnalyzer<'a> {
         }
 
         self.tracker.push_scope();
+        self.analyze_decl_target(target);
         self.define_target_binding(target, true);
         let body_terminates = self.analyze_expr(body);
         self.tracker.pop_scope(self.file, &mut self.diagnostics);
         body_terminates
+    }
+
+    fn analyze_decl_target(&mut self, lexp: &(AstLexp, sail_parser::Span)) -> bool {
+        match &lexp.0 {
+            AstLexp::Attribute { lexp, .. } | AstLexp::Typed { lexp, .. } => {
+                self.analyze_decl_target(lexp)
+            }
+            AstLexp::Id(_) => false,
+            _ => self.analyze_lexp(lexp),
+        }
+    }
+
+    fn analyze_lexp(&mut self, lexp: &(AstLexp, sail_parser::Span)) -> bool {
+        match &lexp.0 {
+            AstLexp::Attribute { lexp, .. } | AstLexp::Typed { lexp, .. } => {
+                self.analyze_lexp(lexp)
+            }
+            AstLexp::Id(name) => {
+                self.tracker.mark_used(name);
+                false
+            }
+            AstLexp::Deref(expr) => self.analyze_expr(expr),
+            AstLexp::Call(call) => {
+                let mut terminates = self.analyze_expr(&call.callee);
+                for arg in &call.args {
+                    terminates |= self.analyze_expr(arg);
+                }
+                terminates
+            }
+            AstLexp::Field { lexp, .. } => self.analyze_lexp(lexp),
+            AstLexp::Vector { lexp, index } => self.analyze_lexp(lexp) || self.analyze_expr(index),
+            AstLexp::VectorRange { lexp, start, end } => {
+                self.analyze_lexp(lexp) || self.analyze_expr(start) || self.analyze_expr(end)
+            }
+            AstLexp::VectorConcat(items) | AstLexp::Tuple(items) => {
+                let mut terminates = false;
+                for item in items {
+                    terminates |= self.analyze_lexp(item);
+                }
+                terminates
+            }
+            AstLexp::Error(_) => false,
+        }
     }
 
     fn analyze_if(
@@ -511,21 +539,6 @@ impl<'a> AstSemanticAnalyzer<'a> {
         }
     }
 
-    fn analyze_vector_update(&mut self, update: &(AstVectorUpdate, sail_parser::Span)) -> bool {
-        match &update.0 {
-            AstVectorUpdate::Assignment { target, value } => {
-                self.analyze_expr(target) || self.analyze_expr(value)
-            }
-            AstVectorUpdate::RangeAssignment { start, end, value } => {
-                self.analyze_expr(start) || self.analyze_expr(end) || self.analyze_expr(value)
-            }
-            AstVectorUpdate::Shorthand(name) => {
-                self.tracker.mark_used(&name.0);
-                false
-            }
-        }
-    }
-
     fn define_pattern_bindings(
         &mut self,
         pattern: &(AstPattern, sail_parser::Span),
@@ -586,15 +599,17 @@ impl<'a> AstSemanticAnalyzer<'a> {
 
     fn define_target_binding(
         &mut self,
-        target: &(AstExpr, sail_parser::Span),
+        target: &(AstLexp, sail_parser::Span),
         warn_unused: bool,
     ) -> bool {
         match &target.0 {
-            AstExpr::Ident(name) => {
+            AstLexp::Id(name) => {
                 self.tracker.define_binding(name, target.1, warn_unused);
                 true
             }
-            AstExpr::Cast { expr, .. } => self.define_target_binding(expr, warn_unused),
+            AstLexp::Attribute { lexp, .. } | AstLexp::Typed { lexp, .. } => {
+                self.define_target_binding(lexp, warn_unused)
+            }
             _ => false,
         }
     }

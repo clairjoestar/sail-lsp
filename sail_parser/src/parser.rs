@@ -2,13 +2,12 @@ use crate::{
     core_ast::{
         BlockItem as AstBlockItem, Call as AstCall, CallableDefKind, CallableSpecKind,
         Expr as AstExpr, FieldExpr as AstFieldExpr, FieldPattern as AstFieldPattern,
-        ForeachExpr as AstForeachExpr, LoopMeasure as AstLoopMeasure,
+        ForeachExpr as AstForeachExpr, Lexp as AstLexp, LoopMeasure as AstLoopMeasure,
         MappingBody as AstMappingBody, MatchCase as AstMatchCase,
         NamedDefDetail as AstNamedDefDetail, NamedDefKind, Pattern as AstPattern,
         ScatteredClauseKind, ScatteredKind, TerminationMeasureKind as AstTerminationMeasureKind,
         TypeExpr as AstTypeExpr, TypeParamSpec as AstTypeParamSpec,
         TypeParamTail as AstTypeParamTail, UnionPayload as AstUnionPayload,
-        VectorUpdate as AstVectorUpdate,
     },
     core_ast::{
         CallableDefinition as CoreCallableDef, CallableSpecification as CoreCallableSpec,
@@ -1433,18 +1432,51 @@ fn callee_name_and_span(expr: &(AstExpr, Span)) -> Option<(String, Span)> {
     }
 }
 
-fn var_target_name(expr: &(AstExpr, Span)) -> Option<(String, Span)> {
+fn var_target_name(expr: &(AstLexp, Span)) -> Option<(String, Span)> {
     match &expr.0 {
-        AstExpr::Ident(name) => Some((name.clone(), expr.1)),
-        AstExpr::Cast { expr, .. } => var_target_name(expr),
+        AstLexp::Id(name) => Some((name.clone(), expr.1)),
+        AstLexp::Attribute { lexp, .. } | AstLexp::Typed { lexp, .. } => var_target_name(lexp),
         _ => None,
     }
 }
 
-fn typed_var_target(expr: &(AstExpr, Span)) -> Option<(String, Span, Span)> {
+fn typed_var_target(expr: &(AstLexp, Span)) -> Option<(String, Span, Span)> {
     match &expr.0 {
-        AstExpr::Cast { expr, ty } => var_target_name(expr).map(|(name, span)| (name, span, ty.1)),
+        AstLexp::Typed { lexp, ty } => var_target_name(lexp).map(|(name, span)| (name, span, ty.1)),
         _ => None,
+    }
+}
+
+fn collect_lexp_metadata(
+    lexp: &(AstLexp, Span),
+    caller: Option<&str>,
+    pattern_constants: &HashSet<String>,
+    parsed: &mut ParsedFile,
+) {
+    match &lexp.0 {
+        AstLexp::Attribute { lexp, .. } | AstLexp::Typed { lexp, .. } => {
+            collect_lexp_metadata(lexp, caller, pattern_constants, parsed)
+        }
+        AstLexp::Deref(expr) => collect_expr_metadata(expr, caller, pattern_constants, parsed),
+        AstLexp::Call(call) => collect_call_metadata(call, caller, pattern_constants, parsed),
+        AstLexp::Field { lexp, .. } => {
+            collect_lexp_metadata(lexp, caller, pattern_constants, parsed)
+        }
+        AstLexp::Vector { lexp, index } => {
+            collect_lexp_metadata(lexp, caller, pattern_constants, parsed);
+            collect_expr_metadata(index, caller, pattern_constants, parsed);
+        }
+        AstLexp::VectorRange { lexp, start, end } => {
+            collect_lexp_metadata(lexp, caller, pattern_constants, parsed);
+            collect_expr_metadata(start, caller, pattern_constants, parsed);
+            collect_expr_metadata(end, caller, pattern_constants, parsed);
+        }
+        AstLexp::VectorConcat(items) | AstLexp::Tuple(items) => {
+            for item in items {
+                collect_lexp_metadata(item, caller, pattern_constants, parsed);
+            }
+        }
+        AstLexp::Id(_) | AstLexp::Error(_) => {}
     }
 }
 
@@ -1457,26 +1489,6 @@ fn collect_field_expr_metadata(
     if let AstFieldExpr::Assignment { target, value } = &field.0 {
         collect_expr_metadata(target, caller, pattern_constants, parsed);
         collect_expr_metadata(value, caller, pattern_constants, parsed);
-    }
-}
-
-fn collect_vector_update_metadata(
-    update: &(AstVectorUpdate, Span),
-    caller: Option<&str>,
-    pattern_constants: &HashSet<String>,
-    parsed: &mut ParsedFile,
-) {
-    match &update.0 {
-        AstVectorUpdate::Assignment { target, value } => {
-            collect_expr_metadata(target, caller, pattern_constants, parsed);
-            collect_expr_metadata(value, caller, pattern_constants, parsed);
-        }
-        AstVectorUpdate::RangeAssignment { start, end, value } => {
-            collect_expr_metadata(start, caller, pattern_constants, parsed);
-            collect_expr_metadata(end, caller, pattern_constants, parsed);
-            collect_expr_metadata(value, caller, pattern_constants, parsed);
-        }
-        AstVectorUpdate::Shorthand(_) => {}
     }
 }
 
@@ -1664,7 +1676,11 @@ fn collect_expr_metadata(
         AstExpr::Attribute { expr, .. } => {
             collect_expr_metadata(expr, caller, pattern_constants, parsed)
         }
-        AstExpr::Assign { lhs, rhs } | AstExpr::Infix { lhs, rhs, .. } => {
+        AstExpr::Assign { lhs, rhs } => {
+            collect_lexp_metadata(lhs, caller, pattern_constants, parsed);
+            collect_expr_metadata(rhs, caller, pattern_constants, parsed);
+        }
+        AstExpr::Infix { lhs, rhs, .. } => {
             collect_expr_metadata(lhs, caller, pattern_constants, parsed);
             collect_expr_metadata(rhs, caller, pattern_constants, parsed);
         }
@@ -1709,7 +1725,7 @@ fn collect_expr_metadata(
                     scope: Scope::Local,
                 });
             }
-            collect_expr_metadata(target, caller, pattern_constants, parsed);
+            collect_lexp_metadata(target, caller, pattern_constants, parsed);
             collect_expr_metadata(value, caller, pattern_constants, parsed);
             collect_expr_metadata(body, caller, pattern_constants, parsed);
         }
@@ -1752,7 +1768,7 @@ fn collect_expr_metadata(
                                 scope: Scope::Local,
                             });
                         }
-                        collect_expr_metadata(target, caller, pattern_constants, parsed);
+                        collect_lexp_metadata(target, caller, pattern_constants, parsed);
                         collect_expr_metadata(value, caller, pattern_constants, parsed);
                     }
                     AstBlockItem::Expr(expr) => {
@@ -1819,24 +1835,6 @@ fn collect_expr_metadata(
             collect_expr_metadata(body, caller, pattern_constants, parsed);
         }
         AstExpr::Call(call) => collect_call_metadata(call, caller, pattern_constants, parsed),
-        AstExpr::Index { expr, index } => {
-            collect_expr_metadata(expr, caller, pattern_constants, parsed);
-            collect_expr_metadata(index, caller, pattern_constants, parsed);
-        }
-        AstExpr::Slice { expr, start, end } => {
-            collect_expr_metadata(expr, caller, pattern_constants, parsed);
-            collect_expr_metadata(start, caller, pattern_constants, parsed);
-            collect_expr_metadata(end, caller, pattern_constants, parsed);
-        }
-        AstExpr::VectorSlice {
-            expr,
-            start,
-            length,
-        } => {
-            collect_expr_metadata(expr, caller, pattern_constants, parsed);
-            collect_expr_metadata(start, caller, pattern_constants, parsed);
-            collect_expr_metadata(length, caller, pattern_constants, parsed);
-        }
         AstExpr::Struct { fields, .. } => {
             for field in fields {
                 collect_field_expr_metadata(field, caller, pattern_constants, parsed);
@@ -1851,12 +1849,6 @@ fn collect_expr_metadata(
         AstExpr::List(items) | AstExpr::Vector(items) | AstExpr::Tuple(items) => {
             for item in items {
                 collect_expr_metadata(item, caller, pattern_constants, parsed);
-            }
-        }
-        AstExpr::VectorUpdate { base, updates } => {
-            collect_expr_metadata(base, caller, pattern_constants, parsed);
-            for update in updates {
-                collect_vector_update_metadata(update, caller, pattern_constants, parsed);
             }
         }
         AstExpr::Literal(_)
@@ -2122,19 +2114,59 @@ fn collect_pattern_symbol_occurrences(
 }
 
 fn visit_var_target_symbol_occurrences(
-    target: &(AstExpr, Span),
+    target: &(AstLexp, Span),
     collector: &mut SymbolOccurrenceCollector,
 ) -> Option<(String, Span)> {
     match &target.0 {
-        AstExpr::Ident(name) => Some((name.clone(), target.1)),
-        AstExpr::Cast { expr, ty } => {
+        AstLexp::Id(name) => Some((name.clone(), target.1)),
+        AstLexp::Attribute { lexp, .. } => visit_var_target_symbol_occurrences(lexp, collector),
+        AstLexp::Typed { lexp, ty } => {
             collect_type_symbol_occurrences(ty, collector);
-            visit_var_target_symbol_occurrences(expr, collector)
+            visit_var_target_symbol_occurrences(lexp, collector)
         }
         _ => {
-            collect_expr_symbol_occurrences(target, collector);
+            collect_lexp_symbol_occurrences(target, collector);
             None
         }
+    }
+}
+
+fn collect_lexp_symbol_occurrences(
+    lexp: &(AstLexp, Span),
+    collector: &mut SymbolOccurrenceCollector,
+) {
+    match &lexp.0 {
+        AstLexp::Attribute { lexp, .. } => collect_lexp_symbol_occurrences(lexp, collector),
+        AstLexp::Typed { lexp, ty } => {
+            collect_type_symbol_occurrences(ty, collector);
+            collect_lexp_symbol_occurrences(lexp, collector);
+        }
+        AstLexp::Id(name) => collector.record_value_ref(name, lexp.1),
+        AstLexp::Deref(expr) => collect_expr_symbol_occurrences(expr, collector),
+        AstLexp::Call(call) => {
+            collect_expr_symbol_occurrences(&call.callee, collector);
+            for arg in &call.args {
+                collect_expr_symbol_occurrences(arg, collector);
+            }
+        }
+        AstLexp::Field { lexp, .. } => {
+            collect_lexp_symbol_occurrences(lexp, collector);
+        }
+        AstLexp::Vector { lexp, index } => {
+            collect_lexp_symbol_occurrences(lexp, collector);
+            collect_expr_symbol_occurrences(index, collector);
+        }
+        AstLexp::VectorRange { lexp, start, end } => {
+            collect_lexp_symbol_occurrences(lexp, collector);
+            collect_expr_symbol_occurrences(start, collector);
+            collect_expr_symbol_occurrences(end, collector);
+        }
+        AstLexp::VectorConcat(items) | AstLexp::Tuple(items) => {
+            for item in items {
+                collect_lexp_symbol_occurrences(item, collector);
+            }
+        }
+        AstLexp::Error(_) => {}
     }
 }
 
@@ -2243,24 +2275,6 @@ fn collect_field_expr_symbol_occurrences(
     }
 }
 
-fn collect_vector_update_symbol_occurrences(
-    update: &(AstVectorUpdate, Span),
-    collector: &mut SymbolOccurrenceCollector,
-) {
-    match &update.0 {
-        AstVectorUpdate::Assignment { target, value } => {
-            collect_expr_symbol_occurrences(target, collector);
-            collect_expr_symbol_occurrences(value, collector);
-        }
-        AstVectorUpdate::RangeAssignment { start, end, value } => {
-            collect_expr_symbol_occurrences(start, collector);
-            collect_expr_symbol_occurrences(end, collector);
-            collect_expr_symbol_occurrences(value, collector);
-        }
-        AstVectorUpdate::Shorthand(name) => collector.record_value_ref(&name.0, name.1),
-    }
-}
-
 fn collect_case_symbol_occurrences(
     case: &(AstMatchCase, Span),
     collector: &mut SymbolOccurrenceCollector,
@@ -2310,7 +2324,7 @@ fn collect_expr_symbol_occurrences(
     match &expr.0 {
         AstExpr::Attribute { expr, .. } => collect_expr_symbol_occurrences(expr, collector),
         AstExpr::Assign { lhs, rhs } => {
-            collect_expr_symbol_occurrences(lhs, collector);
+            collect_lexp_symbol_occurrences(lhs, collector);
             collect_expr_symbol_occurrences(rhs, collector);
         }
         AstExpr::Let { binding, body } => {
@@ -2453,24 +2467,6 @@ fn collect_expr_symbol_occurrences(
         AstExpr::SizeOf(ty) | AstExpr::Constraint(ty) => {
             collect_type_symbol_occurrences(ty, collector);
         }
-        AstExpr::Index { expr, index } => {
-            collect_expr_symbol_occurrences(expr, collector);
-            collect_expr_symbol_occurrences(index, collector);
-        }
-        AstExpr::Slice { expr, start, end } => {
-            collect_expr_symbol_occurrences(expr, collector);
-            collect_expr_symbol_occurrences(start, collector);
-            collect_expr_symbol_occurrences(end, collector);
-        }
-        AstExpr::VectorSlice {
-            expr,
-            start,
-            length,
-        } => {
-            collect_expr_symbol_occurrences(expr, collector);
-            collect_expr_symbol_occurrences(start, collector);
-            collect_expr_symbol_occurrences(length, collector);
-        }
         AstExpr::Struct { name, fields } => {
             if let Some(name) = name {
                 collector.record_type_ref(&name.0, name.1);
@@ -2488,12 +2484,6 @@ fn collect_expr_symbol_occurrences(
         AstExpr::List(items) | AstExpr::Vector(items) | AstExpr::Tuple(items) => {
             for item in items {
                 collect_expr_symbol_occurrences(item, collector);
-            }
-        }
-        AstExpr::VectorUpdate { base, updates } => {
-            collect_expr_symbol_occurrences(base, collector);
-            for update in updates {
-                collect_vector_update_symbol_occurrences(update, collector);
             }
         }
     }

@@ -8,14 +8,14 @@ use chumsky::Parser;
 use sail_parser::{
     core_ast::{
         CallableDefinition, ConstraintDefinition, Definition, DefinitionKind, DirectiveDefinition,
-        NamedDefinition, ScatteredClauseDefinition, ScatteredDefinition, SourceFile,
+        Lexp, NamedDefinition, ScatteredClauseDefinition, ScatteredDefinition, SourceFile,
         TerminationMeasureDefinition, TypeAliasDefinition,
     },
     Attribute, AttributeData, AttributeEntry, BitfieldField, BlockItem, CallableClause,
     DefModifiers, EnumFunction, EnumMember, Expr, ExternBinding, ExternSpec, FieldExpr,
     FieldPattern, LetBinding, LoopMeasure, MappingBody, MatchCase, NamedDefDetail, Pattern,
     RecMeasure, Span, TerminationMeasureKind, TypeExpr, TypeParam, TypeParamSpec, TypeParamTail,
-    TypedField, UnionPayload, UnionVariant, VectorUpdate,
+    TypedField, UnionPayload, UnionVariant,
 };
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -781,26 +781,6 @@ fn collect_field_expr_errors(
     }
 }
 
-fn collect_vector_update_errors(
-    update: &VectorUpdate,
-    source: &str,
-    path: &Path,
-    buckets: &mut BTreeMap<(ErrorKind, String), SampleBucket>,
-) {
-    match update {
-        VectorUpdate::Assignment { target, value } => {
-            collect_expr_errors(target, source, path, buckets);
-            collect_expr_errors(value, source, path, buckets);
-        }
-        VectorUpdate::RangeAssignment { start, end, value } => {
-            collect_expr_errors(start, source, path, buckets);
-            collect_expr_errors(end, source, path, buckets);
-            collect_expr_errors(value, source, path, buckets);
-        }
-        VectorUpdate::Shorthand(_) => {}
-    }
-}
-
 fn collect_expr_errors(
     expr: &(Expr, Span),
     source: &str,
@@ -813,7 +793,11 @@ fn collect_expr_errors(
             collect_attribute_errors(&attr.0, source, path, buckets);
             collect_expr_errors(expr, source, path, buckets);
         }
-        Expr::Assign { lhs, rhs } | Expr::Infix { lhs, rhs, .. } => {
+        Expr::Assign { lhs, rhs } => {
+            collect_lexp_errors(lhs, source, path, buckets);
+            collect_expr_errors(rhs, source, path, buckets);
+        }
+        Expr::Infix { lhs, rhs, .. } => {
             collect_expr_errors(lhs, source, path, buckets);
             collect_expr_errors(rhs, source, path, buckets);
         }
@@ -826,7 +810,7 @@ fn collect_expr_errors(
             value,
             body,
         } => {
-            collect_expr_errors(target, source, path, buckets);
+            collect_lexp_errors(target, source, path, buckets);
             collect_expr_errors(value, source, path, buckets);
             collect_expr_errors(body, source, path, buckets);
         }
@@ -837,7 +821,7 @@ fn collect_expr_errors(
                         collect_let_binding_errors(binding, source, path, buckets)
                     }
                     BlockItem::Var { target, value } => {
-                        collect_expr_errors(target, source, path, buckets);
+                        collect_lexp_errors(target, source, path, buckets);
                         collect_expr_errors(value, source, path, buckets);
                     }
                     BlockItem::Expr(expr) => collect_expr_errors(expr, source, path, buckets),
@@ -919,24 +903,6 @@ fn collect_expr_errors(
         Expr::SizeOf(ty) | Expr::Constraint(ty) => {
             collect_type_expr_errors(ty, source, path, buckets);
         }
-        Expr::Index { expr, index } => {
-            collect_expr_errors(expr, source, path, buckets);
-            collect_expr_errors(index, source, path, buckets);
-        }
-        Expr::Slice { expr, start, end } => {
-            collect_expr_errors(expr, source, path, buckets);
-            collect_expr_errors(start, source, path, buckets);
-            collect_expr_errors(end, source, path, buckets);
-        }
-        Expr::VectorSlice {
-            expr,
-            start,
-            length,
-        } => {
-            collect_expr_errors(expr, source, path, buckets);
-            collect_expr_errors(start, source, path, buckets);
-            collect_expr_errors(length, source, path, buckets);
-        }
         Expr::Struct { fields, .. } => {
             for field in fields {
                 collect_field_expr_errors(&field.0, source, path, buckets);
@@ -953,12 +919,48 @@ fn collect_expr_errors(
                 collect_expr_errors(item, source, path, buckets);
             }
         }
-        Expr::VectorUpdate { base, updates } => {
-            collect_expr_errors(base, source, path, buckets);
-            for update in updates {
-                collect_vector_update_errors(&update.0, source, path, buckets);
+        Expr::Literal(_) | Expr::Ident(_) | Expr::TypeVar(_) | Expr::Ref(_) | Expr::Config(_) => {}
+    }
+}
+
+fn collect_lexp_errors(
+    lexp: &(Lexp, Span),
+    source: &str,
+    path: &Path,
+    buckets: &mut BTreeMap<(ErrorKind, String), SampleBucket>,
+) {
+    match &lexp.0 {
+        Lexp::Error(_) => record_error(buckets, ErrorKind::Expr, source, path, lexp.1),
+        Lexp::Attribute { attr, lexp } => {
+            collect_attribute_errors(&attr.0, source, path, buckets);
+            collect_lexp_errors(lexp, source, path, buckets);
+        }
+        Lexp::Typed { lexp, ty } => {
+            collect_lexp_errors(lexp, source, path, buckets);
+            collect_type_expr_errors(ty, source, path, buckets);
+        }
+        Lexp::Deref(expr) => collect_expr_errors(expr, source, path, buckets),
+        Lexp::Call(call) => {
+            collect_expr_errors(&call.callee, source, path, buckets);
+            for arg in &call.args {
+                collect_expr_errors(arg, source, path, buckets);
             }
         }
-        Expr::Literal(_) | Expr::Ident(_) | Expr::TypeVar(_) | Expr::Ref(_) | Expr::Config(_) => {}
+        Lexp::Field { lexp, .. } => collect_lexp_errors(lexp, source, path, buckets),
+        Lexp::Vector { lexp, index } => {
+            collect_lexp_errors(lexp, source, path, buckets);
+            collect_expr_errors(index, source, path, buckets);
+        }
+        Lexp::VectorRange { lexp, start, end } => {
+            collect_lexp_errors(lexp, source, path, buckets);
+            collect_expr_errors(start, source, path, buckets);
+            collect_expr_errors(end, source, path, buckets);
+        }
+        Lexp::VectorConcat(items) | Lexp::Tuple(items) => {
+            for item in items {
+                collect_lexp_errors(item, source, path, buckets);
+            }
+        }
+        Lexp::Id(_) => {}
     }
 }

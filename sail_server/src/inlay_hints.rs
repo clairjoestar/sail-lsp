@@ -3,7 +3,7 @@ use crate::state::File;
 use crate::symbols::{find_callable_signature, inlay_param_name};
 use sail_parser::{
     core_ast::{DefinitionKind, SourceFile},
-    BlockItem, Expr, NamedDefKind, Pattern, Span,
+    BlockItem, Expr, Lexp, NamedDefKind, Pattern, Span,
 };
 use tower_lsp::lsp_types::{
     InlayHint, InlayHintKind, InlayHintLabel, InlayHintTooltip, Range, Url,
@@ -19,6 +19,14 @@ fn expr_symbol(expr: &(Expr, Span)) -> Option<&str> {
         Expr::Field { field, .. } => Some(field.0.as_str()),
         _ => None,
     }
+}
+
+fn has_synthetic_modifier_receiver(call: &sail_parser::Call) -> bool {
+    matches!(&call.callee.0, Expr::Ident(name) if name.starts_with("_mod_"))
+        && call
+            .args
+            .first()
+            .is_some_and(|arg| arg.1.end <= call.callee.1.start)
 }
 
 fn label_text(label: &InlayHintLabel) -> &str {
@@ -79,7 +87,8 @@ fn maybe_push_parameter_hints_for_call<'a>(
         return;
     }
 
-    for (arg_idx, arg) in call.args.iter().enumerate() {
+    let first_visible_arg = usize::from(has_synthetic_modifier_receiver(call));
+    for (arg_idx, arg) in call.args.iter().enumerate().skip(first_visible_arg) {
         if arg_idx >= sig.params.len() || !span_starts_in_range(arg.1, begin, end) {
             continue;
         }
@@ -101,7 +110,11 @@ fn visit_expr_parameter_hints<'a>(
         Expr::Attribute { expr, .. } => {
             visit_expr_parameter_hints(files, current_uri, current_file, expr, begin, end, hints)
         }
-        Expr::Assign { lhs, rhs } | Expr::Infix { lhs, rhs, .. } => {
+        Expr::Assign { lhs, rhs } => {
+            visit_lexp_parameter_hints(files, current_uri, current_file, lhs, begin, end, hints);
+            visit_expr_parameter_hints(files, current_uri, current_file, rhs, begin, end, hints);
+        }
+        Expr::Infix { lhs, rhs, .. } => {
             visit_expr_parameter_hints(files, current_uri, current_file, lhs, begin, end, hints);
             visit_expr_parameter_hints(files, current_uri, current_file, rhs, begin, end, hints);
         }
@@ -122,7 +135,7 @@ fn visit_expr_parameter_hints<'a>(
             value,
             body,
         } => {
-            visit_expr_parameter_hints(files, current_uri, current_file, target, begin, end, hints);
+            visit_lexp_parameter_hints(files, current_uri, current_file, target, begin, end, hints);
             visit_expr_parameter_hints(files, current_uri, current_file, value, begin, end, hints);
             visit_expr_parameter_hints(files, current_uri, current_file, body, begin, end, hints);
         }
@@ -139,7 +152,7 @@ fn visit_expr_parameter_hints<'a>(
                         hints,
                     ),
                     BlockItem::Var { target, value } => {
-                        visit_expr_parameter_hints(
+                        visit_lexp_parameter_hints(
                             files,
                             current_uri,
                             current_file,
@@ -339,36 +352,6 @@ fn visit_expr_parameter_hints<'a>(
                 );
             }
         }
-        Expr::Index { expr, index } => {
-            visit_expr_parameter_hints(files, current_uri, current_file, expr, begin, end, hints);
-            visit_expr_parameter_hints(files, current_uri, current_file, index, begin, end, hints);
-        }
-        Expr::Slice {
-            expr,
-            start,
-            end: slice_end,
-        } => {
-            visit_expr_parameter_hints(files, current_uri, current_file, expr, begin, end, hints);
-            visit_expr_parameter_hints(files, current_uri, current_file, start, begin, end, hints);
-            visit_expr_parameter_hints(
-                files,
-                current_uri,
-                current_file,
-                slice_end,
-                begin,
-                end,
-                hints,
-            );
-        }
-        Expr::VectorSlice {
-            expr,
-            start,
-            length,
-        } => {
-            visit_expr_parameter_hints(files, current_uri, current_file, expr, begin, end, hints);
-            visit_expr_parameter_hints(files, current_uri, current_file, start, begin, end, hints);
-            visit_expr_parameter_hints(files, current_uri, current_file, length, begin, end, hints);
-        }
         Expr::Struct { fields, .. } => {
             for field in fields {
                 if let sail_parser::FieldExpr::Assignment { target, value } = &field.0 {
@@ -431,67 +414,6 @@ fn visit_expr_parameter_hints<'a>(
                 );
             }
         }
-        Expr::VectorUpdate { base, updates } => {
-            visit_expr_parameter_hints(files, current_uri, current_file, base, begin, end, hints);
-            for update in updates {
-                match &update.0 {
-                    sail_parser::VectorUpdate::Assignment { target, value } => {
-                        visit_expr_parameter_hints(
-                            files,
-                            current_uri,
-                            current_file,
-                            target,
-                            begin,
-                            end,
-                            hints,
-                        );
-                        visit_expr_parameter_hints(
-                            files,
-                            current_uri,
-                            current_file,
-                            value,
-                            begin,
-                            end,
-                            hints,
-                        );
-                    }
-                    sail_parser::VectorUpdate::RangeAssignment {
-                        start,
-                        end: range_end,
-                        value,
-                    } => {
-                        visit_expr_parameter_hints(
-                            files,
-                            current_uri,
-                            current_file,
-                            start,
-                            begin,
-                            end,
-                            hints,
-                        );
-                        visit_expr_parameter_hints(
-                            files,
-                            current_uri,
-                            current_file,
-                            range_end,
-                            begin,
-                            end,
-                            hints,
-                        );
-                        visit_expr_parameter_hints(
-                            files,
-                            current_uri,
-                            current_file,
-                            value,
-                            begin,
-                            end,
-                            hints,
-                        );
-                    }
-                    sail_parser::VectorUpdate::Shorthand(_) => {}
-                }
-            }
-        }
         Expr::Literal(_)
         | Expr::Ident(_)
         | Expr::TypeVar(_)
@@ -500,6 +422,94 @@ fn visit_expr_parameter_hints<'a>(
         | Expr::SizeOf(_)
         | Expr::Constraint(_)
         | Expr::Error(_) => {}
+    }
+}
+
+fn visit_lexp_parameter_hints<'a>(
+    files: &[(&'a Url, &'a File)],
+    current_uri: &Url,
+    current_file: &File,
+    lexp: &(Lexp, Span),
+    begin: usize,
+    end: usize,
+    hints: &mut Vec<InlayHint>,
+) {
+    match &lexp.0 {
+        Lexp::Attribute { lexp, .. } | Lexp::Typed { lexp, .. } => {
+            visit_lexp_parameter_hints(files, current_uri, current_file, lexp, begin, end, hints)
+        }
+        Lexp::Deref(expr) => {
+            visit_expr_parameter_hints(files, current_uri, current_file, expr, begin, end, hints)
+        }
+        Lexp::Call(call) => {
+            maybe_push_parameter_hints_for_call(
+                files,
+                current_uri,
+                current_file,
+                call,
+                begin,
+                end,
+                hints,
+            );
+            visit_expr_parameter_hints(
+                files,
+                current_uri,
+                current_file,
+                &call.callee,
+                begin,
+                end,
+                hints,
+            );
+            for arg in &call.args {
+                visit_expr_parameter_hints(
+                    files,
+                    current_uri,
+                    current_file,
+                    arg,
+                    begin,
+                    end,
+                    hints,
+                );
+            }
+        }
+        Lexp::Field { lexp, .. } => {
+            visit_lexp_parameter_hints(files, current_uri, current_file, lexp, begin, end, hints)
+        }
+        Lexp::Vector { lexp, index } => {
+            visit_lexp_parameter_hints(files, current_uri, current_file, lexp, begin, end, hints);
+            visit_expr_parameter_hints(files, current_uri, current_file, index, begin, end, hints);
+        }
+        Lexp::VectorRange {
+            lexp,
+            start,
+            end: range_end,
+        } => {
+            visit_lexp_parameter_hints(files, current_uri, current_file, lexp, begin, end, hints);
+            visit_expr_parameter_hints(files, current_uri, current_file, start, begin, end, hints);
+            visit_expr_parameter_hints(
+                files,
+                current_uri,
+                current_file,
+                range_end,
+                begin,
+                end,
+                hints,
+            );
+        }
+        Lexp::VectorConcat(items) | Lexp::Tuple(items) => {
+            for item in items {
+                visit_lexp_parameter_hints(
+                    files,
+                    current_uri,
+                    current_file,
+                    item,
+                    begin,
+                    end,
+                    hints,
+                );
+            }
+        }
+        Lexp::Id(_) | Lexp::Error(_) => {}
     }
 }
 
@@ -513,10 +523,11 @@ fn pattern_binding_name(pattern: &(Pattern, Span)) -> Option<(&str, Span)> {
     }
 }
 
-fn target_binding_name(target: &(Expr, Span)) -> Option<(&str, Span)> {
+fn target_binding_name(target: &(Lexp, Span)) -> Option<(&str, Span)> {
     match &target.0 {
-        Expr::Ident(name) => Some((name.as_str(), target.1)),
-        Expr::Cast { .. } => None,
+        Lexp::Id(name) => Some((name.as_str(), target.1)),
+        Lexp::Attribute { lexp, .. } => target_binding_name(lexp),
+        Lexp::Typed { .. } => None,
         _ => None,
     }
 }
@@ -553,7 +564,11 @@ fn visit_expr_type_hints<'a>(
         Expr::Attribute { expr, .. } => {
             visit_expr_type_hints(files, current_uri, current_file, expr, begin, end, hints)
         }
-        Expr::Assign { lhs, rhs } | Expr::Infix { lhs, rhs, .. } => {
+        Expr::Assign { lhs, rhs } => {
+            visit_lexp_type_hints(files, current_uri, current_file, lhs, begin, end, hints);
+            visit_expr_type_hints(files, current_uri, current_file, rhs, begin, end, hints);
+        }
+        Expr::Infix { lhs, rhs, .. } => {
             visit_expr_type_hints(files, current_uri, current_file, lhs, begin, end, hints);
             visit_expr_type_hints(files, current_uri, current_file, rhs, begin, end, hints);
         }
@@ -598,7 +613,7 @@ fn visit_expr_type_hints<'a>(
                     hints,
                 );
             }
-            visit_expr_type_hints(files, current_uri, current_file, target, begin, end, hints);
+            visit_lexp_type_hints(files, current_uri, current_file, target, begin, end, hints);
             visit_expr_type_hints(files, current_uri, current_file, value, begin, end, hints);
             visit_expr_type_hints(files, current_uri, current_file, body, begin, end, hints);
         }
@@ -641,7 +656,7 @@ fn visit_expr_type_hints<'a>(
                                 hints,
                             );
                         }
-                        visit_expr_type_hints(
+                        visit_lexp_type_hints(
                             files,
                             current_uri,
                             current_file,
@@ -800,36 +815,6 @@ fn visit_expr_type_hints<'a>(
                 visit_expr_type_hints(files, current_uri, current_file, arg, begin, end, hints);
             }
         }
-        Expr::Index { expr, index } => {
-            visit_expr_type_hints(files, current_uri, current_file, expr, begin, end, hints);
-            visit_expr_type_hints(files, current_uri, current_file, index, begin, end, hints);
-        }
-        Expr::Slice {
-            expr,
-            start,
-            end: slice_end,
-        } => {
-            visit_expr_type_hints(files, current_uri, current_file, expr, begin, end, hints);
-            visit_expr_type_hints(files, current_uri, current_file, start, begin, end, hints);
-            visit_expr_type_hints(
-                files,
-                current_uri,
-                current_file,
-                slice_end,
-                begin,
-                end,
-                hints,
-            );
-        }
-        Expr::VectorSlice {
-            expr,
-            start,
-            length,
-        } => {
-            visit_expr_type_hints(files, current_uri, current_file, expr, begin, end, hints);
-            visit_expr_type_hints(files, current_uri, current_file, start, begin, end, hints);
-            visit_expr_type_hints(files, current_uri, current_file, length, begin, end, hints);
-        }
         Expr::Struct { fields, .. } => {
             for field in fields {
                 if let sail_parser::FieldExpr::Assignment { target, value } = &field.0 {
@@ -884,67 +869,6 @@ fn visit_expr_type_hints<'a>(
                 visit_expr_type_hints(files, current_uri, current_file, item, begin, end, hints);
             }
         }
-        Expr::VectorUpdate { base, updates } => {
-            visit_expr_type_hints(files, current_uri, current_file, base, begin, end, hints);
-            for update in updates {
-                match &update.0 {
-                    sail_parser::VectorUpdate::Assignment { target, value } => {
-                        visit_expr_type_hints(
-                            files,
-                            current_uri,
-                            current_file,
-                            target,
-                            begin,
-                            end,
-                            hints,
-                        );
-                        visit_expr_type_hints(
-                            files,
-                            current_uri,
-                            current_file,
-                            value,
-                            begin,
-                            end,
-                            hints,
-                        );
-                    }
-                    sail_parser::VectorUpdate::RangeAssignment {
-                        start,
-                        end: range_end,
-                        value,
-                    } => {
-                        visit_expr_type_hints(
-                            files,
-                            current_uri,
-                            current_file,
-                            start,
-                            begin,
-                            end,
-                            hints,
-                        );
-                        visit_expr_type_hints(
-                            files,
-                            current_uri,
-                            current_file,
-                            range_end,
-                            begin,
-                            end,
-                            hints,
-                        );
-                        visit_expr_type_hints(
-                            files,
-                            current_uri,
-                            current_file,
-                            value,
-                            begin,
-                            end,
-                            hints,
-                        );
-                    }
-                    sail_parser::VectorUpdate::Shorthand(_) => {}
-                }
-            }
-        }
         Expr::Literal(_)
         | Expr::Ident(_)
         | Expr::TypeVar(_)
@@ -953,6 +877,72 @@ fn visit_expr_type_hints<'a>(
         | Expr::SizeOf(_)
         | Expr::Constraint(_)
         | Expr::Error(_) => {}
+    }
+}
+
+fn visit_lexp_type_hints<'a>(
+    files: &[(&'a Url, &'a File)],
+    current_uri: &Url,
+    current_file: &File,
+    lexp: &(Lexp, Span),
+    begin: usize,
+    end: usize,
+    hints: &mut Vec<InlayHint>,
+) {
+    match &lexp.0 {
+        Lexp::Attribute { lexp, .. } => {
+            visit_lexp_type_hints(files, current_uri, current_file, lexp, begin, end, hints)
+        }
+        Lexp::Typed { lexp, .. } => {
+            visit_lexp_type_hints(files, current_uri, current_file, lexp, begin, end, hints)
+        }
+        Lexp::Deref(expr) => {
+            visit_expr_type_hints(files, current_uri, current_file, expr, begin, end, hints)
+        }
+        Lexp::Call(call) => {
+            visit_expr_type_hints(
+                files,
+                current_uri,
+                current_file,
+                &call.callee,
+                begin,
+                end,
+                hints,
+            );
+            for arg in &call.args {
+                visit_expr_type_hints(files, current_uri, current_file, arg, begin, end, hints);
+            }
+        }
+        Lexp::Field { lexp, .. } => {
+            visit_lexp_type_hints(files, current_uri, current_file, lexp, begin, end, hints)
+        }
+        Lexp::Vector { lexp, index } => {
+            visit_lexp_type_hints(files, current_uri, current_file, lexp, begin, end, hints);
+            visit_expr_type_hints(files, current_uri, current_file, index, begin, end, hints);
+        }
+        Lexp::VectorRange {
+            lexp,
+            start,
+            end: range_end,
+        } => {
+            visit_lexp_type_hints(files, current_uri, current_file, lexp, begin, end, hints);
+            visit_expr_type_hints(files, current_uri, current_file, start, begin, end, hints);
+            visit_expr_type_hints(
+                files,
+                current_uri,
+                current_file,
+                range_end,
+                begin,
+                end,
+                hints,
+            );
+        }
+        Lexp::VectorConcat(items) | Lexp::Tuple(items) => {
+            for item in items {
+                visit_lexp_type_hints(files, current_uri, current_file, item, begin, end, hints);
+            }
+        }
+        Lexp::Id(_) | Lexp::Error(_) => {}
     }
 }
 

@@ -1,8 +1,7 @@
 use crate::{
     core_ast::{
-        BlockItem, Call, DefinitionKind as CoreDefinitionKind, Expr, FieldExpr, FieldPattern,
+        BlockItem, Call, DefinitionKind as CoreDefinitionKind, Expr, FieldExpr, FieldPattern, Lexp,
         NamedDefKind, Pattern, ScatteredClauseKind, SourceFile as CoreSourceFile, Spanned,
-        VectorUpdate,
     },
     Span,
 };
@@ -35,6 +34,14 @@ fn expr_symbol(expr: &Spanned<Expr>) -> Option<(&str, Span)> {
     }
 }
 
+fn has_synthetic_modifier_receiver(call: &Call) -> bool {
+    matches!(&call.callee.0, Expr::Ident(name) if name.starts_with("_mod_"))
+        && call
+            .args
+            .first()
+            .is_some_and(|arg| arg.1.end <= call.callee.1.start)
+}
+
 fn maybe_update_call<'a>(
     best: &mut Option<(usize, CallAtOffset<'a>)>,
     expr_span: Span,
@@ -48,11 +55,14 @@ fn maybe_update_call<'a>(
         return;
     };
     let width = expr_span.end.saturating_sub(expr_span.start);
-    let arg_index = call
+    let mut arg_index = call
         .arg_separator_spans
         .iter()
         .filter(|span| span.start < offset)
         .count();
+    if has_synthetic_modifier_receiver(call) && offset >= call.open_span.start {
+        arg_index += 1;
+    }
     let candidate = CallAtOffset {
         callee,
         callee_span,
@@ -79,7 +89,11 @@ fn visit_expr<'a>(
 
     match &expr.0 {
         Expr::Attribute { expr, .. } => visit_expr(expr, offset, best),
-        Expr::Assign { lhs, rhs } | Expr::Infix { lhs, rhs, .. } => {
+        Expr::Assign { lhs, rhs } => {
+            visit_lexp(lhs, offset, best);
+            visit_expr(rhs, offset, best);
+        }
+        Expr::Infix { lhs, rhs, .. } => {
             visit_expr(lhs, offset, best);
             visit_expr(rhs, offset, best);
         }
@@ -92,7 +106,7 @@ fn visit_expr<'a>(
             value,
             body,
         } => {
-            visit_expr(target, offset, best);
+            visit_lexp(target, offset, best);
             visit_expr(value, offset, best);
             visit_expr(body, offset, best);
         }
@@ -101,7 +115,7 @@ fn visit_expr<'a>(
                 match &item.0 {
                     BlockItem::Let(binding) => visit_expr(&binding.value, offset, best),
                     BlockItem::Var { target, value } => {
-                        visit_expr(target, offset, best);
+                        visit_lexp(target, offset, best);
                         visit_expr(value, offset, best);
                     }
                     BlockItem::Expr(expr) => visit_expr(expr, offset, best),
@@ -171,24 +185,6 @@ fn visit_expr<'a>(
                 visit_expr(arg, offset, best);
             }
         }
-        Expr::Index { expr, index } => {
-            visit_expr(expr, offset, best);
-            visit_expr(index, offset, best);
-        }
-        Expr::Slice { expr, start, end } => {
-            visit_expr(expr, offset, best);
-            visit_expr(start, offset, best);
-            visit_expr(end, offset, best);
-        }
-        Expr::VectorSlice {
-            expr,
-            start,
-            length,
-        } => {
-            visit_expr(expr, offset, best);
-            visit_expr(start, offset, best);
-            visit_expr(length, offset, best);
-        }
         Expr::Struct { fields, .. } => {
             for field in fields {
                 if let FieldExpr::Assignment { target, value } = &field.0 {
@@ -211,23 +207,6 @@ fn visit_expr<'a>(
                 visit_expr(item, offset, best);
             }
         }
-        Expr::VectorUpdate { base, updates } => {
-            visit_expr(base, offset, best);
-            for update in updates {
-                match &update.0 {
-                    VectorUpdate::Assignment { target, value } => {
-                        visit_expr(target, offset, best);
-                        visit_expr(value, offset, best);
-                    }
-                    VectorUpdate::RangeAssignment { start, end, value } => {
-                        visit_expr(start, offset, best);
-                        visit_expr(end, offset, best);
-                        visit_expr(value, offset, best);
-                    }
-                    VectorUpdate::Shorthand(_) => {}
-                }
-            }
-        }
         Expr::Literal(_)
         | Expr::Ident(_)
         | Expr::TypeVar(_)
@@ -236,6 +215,44 @@ fn visit_expr<'a>(
         | Expr::SizeOf(_)
         | Expr::Constraint(_)
         | Expr::Error(_) => {}
+    }
+}
+
+fn visit_lexp<'a>(
+    lexp: &'a Spanned<Lexp>,
+    offset: usize,
+    best: &mut Option<(usize, CallAtOffset<'a>)>,
+) {
+    if !span_contains(lexp.1, offset) {
+        return;
+    }
+
+    match &lexp.0 {
+        Lexp::Attribute { lexp, .. } | Lexp::Typed { lexp, .. } => visit_lexp(lexp, offset, best),
+        Lexp::Deref(expr) => visit_expr(expr, offset, best),
+        Lexp::Call(call) => {
+            maybe_update_call(best, lexp.1, call, offset);
+            visit_expr(&call.callee, offset, best);
+            for arg in &call.args {
+                visit_expr(arg, offset, best);
+            }
+        }
+        Lexp::Field { lexp, .. } => visit_lexp(lexp, offset, best),
+        Lexp::Vector { lexp, index } => {
+            visit_lexp(lexp, offset, best);
+            visit_expr(index, offset, best);
+        }
+        Lexp::VectorRange { lexp, start, end } => {
+            visit_lexp(lexp, offset, best);
+            visit_expr(start, offset, best);
+            visit_expr(end, offset, best);
+        }
+        Lexp::VectorConcat(items) | Lexp::Tuple(items) => {
+            for item in items {
+                visit_lexp(item, offset, best);
+            }
+        }
+        Lexp::Id(_) | Lexp::Error(_) => {}
     }
 }
 
@@ -362,12 +379,48 @@ fn pattern_binding_explicit_ty(
     }
 }
 
-fn target_binding_explicit_ty(target: &Spanned<Expr>, name_span: Span) -> Option<Option<Span>> {
+fn target_binding_explicit_ty(target: &Spanned<Lexp>, name_span: Span) -> Option<Option<Span>> {
     match &target.0 {
-        Expr::Ident(_) if target.1 == name_span => Some(None),
-        Expr::Cast { expr, ty } => target_binding_explicit_ty(expr, name_span)
+        Lexp::Id(_) if target.1 == name_span => Some(None),
+        Lexp::Attribute { lexp, .. } => target_binding_explicit_ty(lexp, name_span),
+        Lexp::Typed { lexp, ty } => target_binding_explicit_ty(lexp, name_span)
             .map(|explicit_ty| explicit_ty.or(Some(ty.1))),
         _ => None,
+    }
+}
+
+fn find_binding_value_in_lexp<'a>(
+    lexp: &'a Spanned<Lexp>,
+    name_span: Span,
+) -> Option<BindingValueAtSpan<'a>> {
+    match &lexp.0 {
+        Lexp::Attribute { lexp, .. } | Lexp::Typed { lexp, .. } => {
+            find_binding_value_in_lexp(lexp, name_span)
+        }
+        Lexp::Deref(expr) => find_binding_value_in_expr(expr, name_span),
+        Lexp::Call(call) => find_binding_value_in_expr(&call.callee, name_span).or_else(|| {
+            for arg in &call.args {
+                if let Some(binding) = find_binding_value_in_expr(arg, name_span) {
+                    return Some(binding);
+                }
+            }
+            None
+        }),
+        Lexp::Field { lexp, .. } => find_binding_value_in_lexp(lexp, name_span),
+        Lexp::Vector { lexp, index } => find_binding_value_in_lexp(lexp, name_span)
+            .or_else(|| find_binding_value_in_expr(index, name_span)),
+        Lexp::VectorRange { lexp, start, end } => find_binding_value_in_lexp(lexp, name_span)
+            .or_else(|| find_binding_value_in_expr(start, name_span))
+            .or_else(|| find_binding_value_in_expr(end, name_span)),
+        Lexp::VectorConcat(items) | Lexp::Tuple(items) => {
+            for item in items {
+                if let Some(binding) = find_binding_value_in_lexp(item, name_span) {
+                    return Some(binding);
+                }
+            }
+            None
+        }
+        Lexp::Id(_) | Lexp::Error(_) => None,
     }
 }
 
@@ -377,10 +430,10 @@ fn find_binding_value_in_expr<'a>(
 ) -> Option<BindingValueAtSpan<'a>> {
     match &expr.0 {
         Expr::Attribute { expr, .. } => find_binding_value_in_expr(expr, name_span),
-        Expr::Assign { lhs, rhs } | Expr::Infix { lhs, rhs, .. } => {
-            find_binding_value_in_expr(lhs, name_span)
-                .or_else(|| find_binding_value_in_expr(rhs, name_span))
-        }
+        Expr::Assign { lhs, rhs } => find_binding_value_in_lexp(lhs, name_span)
+            .or_else(|| find_binding_value_in_expr(rhs, name_span)),
+        Expr::Infix { lhs, rhs, .. } => find_binding_value_in_expr(lhs, name_span)
+            .or_else(|| find_binding_value_in_expr(rhs, name_span)),
         Expr::Let { binding, body } => pattern_binding_explicit_ty(&binding.pattern, name_span)
             .map(|explicit_ty| BindingValueAtSpan {
                 explicit_ty,
@@ -397,7 +450,7 @@ fn find_binding_value_in_expr<'a>(
         } => target_binding_explicit_ty(target, name_span)
             .map(|explicit_ty| BindingValueAtSpan { explicit_ty, value })
             .or_else(|| {
-                find_binding_value_in_expr(target, name_span)
+                find_binding_value_in_lexp(target, name_span)
                     .or_else(|| find_binding_value_in_expr(value, name_span))
                     .or_else(|| find_binding_value_in_expr(body, name_span))
             }),
@@ -422,7 +475,7 @@ fn find_binding_value_in_expr<'a>(
                         if let Some(explicit_ty) = target_binding_explicit_ty(target, name_span) {
                             return Some(BindingValueAtSpan { explicit_ty, value });
                         }
-                        if let Some(binding) = find_binding_value_in_expr(target, name_span) {
+                        if let Some(binding) = find_binding_value_in_lexp(target, name_span) {
                             return Some(binding);
                         }
                         if let Some(binding) = find_binding_value_in_expr(value, name_span) {
@@ -512,18 +565,6 @@ fn find_binding_value_in_expr<'a>(
             }
             None
         }),
-        Expr::Index { expr, index } => find_binding_value_in_expr(expr, name_span)
-            .or_else(|| find_binding_value_in_expr(index, name_span)),
-        Expr::Slice { expr, start, end } => find_binding_value_in_expr(expr, name_span)
-            .or_else(|| find_binding_value_in_expr(start, name_span))
-            .or_else(|| find_binding_value_in_expr(end, name_span)),
-        Expr::VectorSlice {
-            expr,
-            start,
-            length,
-        } => find_binding_value_in_expr(expr, name_span)
-            .or_else(|| find_binding_value_in_expr(start, name_span))
-            .or_else(|| find_binding_value_in_expr(length, name_span)),
         Expr::Struct { fields, .. } => {
             for field in fields {
                 if let FieldExpr::Assignment { target, value } = &field.0 {
@@ -560,34 +601,6 @@ fn find_binding_value_in_expr<'a>(
             }
             None
         }
-        Expr::VectorUpdate { base, updates } => find_binding_value_in_expr(base, name_span)
-            .or_else(|| {
-                for update in updates {
-                    match &update.0 {
-                        VectorUpdate::Assignment { target, value } => {
-                            if let Some(binding) = find_binding_value_in_expr(target, name_span) {
-                                return Some(binding);
-                            }
-                            if let Some(binding) = find_binding_value_in_expr(value, name_span) {
-                                return Some(binding);
-                            }
-                        }
-                        VectorUpdate::RangeAssignment { start, end, value } => {
-                            if let Some(binding) = find_binding_value_in_expr(start, name_span) {
-                                return Some(binding);
-                            }
-                            if let Some(binding) = find_binding_value_in_expr(end, name_span) {
-                                return Some(binding);
-                            }
-                            if let Some(binding) = find_binding_value_in_expr(value, name_span) {
-                                return Some(binding);
-                            }
-                        }
-                        VectorUpdate::Shorthand(_) => {}
-                    }
-                }
-                None
-            }),
         Expr::Literal(_)
         | Expr::Ident(_)
         | Expr::TypeVar(_)
@@ -800,6 +813,19 @@ mod tests {
         let call = find_call_at_offset_core(&ast, offset).expect("call");
         assert_eq!(call.callee, "inner");
         assert_eq!(call.args.len(), 1);
+    }
+
+    #[test]
+    fn counts_synthetic_modifier_receiver_in_arg_index() {
+        let source = "function foo(x, y) = x.bar(y)";
+        let tokens = crate::lexer().parse(source).into_result().unwrap();
+        let ast = crate::parse_core_source(&tokens).into_result().unwrap();
+        let offset = source.rfind('y').unwrap();
+
+        let call = find_call_at_offset_core(&ast, offset).expect("call");
+        assert_eq!(call.callee, "_mod_bar");
+        assert_eq!(call.arg_index, 1);
+        assert_eq!(call.args.len(), 2);
     }
 
     #[test]
