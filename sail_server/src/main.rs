@@ -41,7 +41,7 @@ pub(crate) use state::File;
 pub(crate) use symbols::analysis::Parameter;
 #[cfg(test)]
 pub(crate) use symbols::{
-    call_edges_for_file, code_lens_title, code_lenses_for_file, collect_callable_signatures,
+    code_lens_title, code_lenses_for_file, collect_callable_signatures,
     collect_implementation_counts, collect_reference_counts, find_call_at_position,
     find_callable_signature, function_snippet, implementation_locations, infer_binding_type,
     normalize_validated_rename, parse_named_type, reference_locations, rename_edits,

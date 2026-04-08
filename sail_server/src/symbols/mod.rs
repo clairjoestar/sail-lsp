@@ -24,7 +24,7 @@ pub(crate) use navigation::{
     will_rename_file_edits,
 };
 #[cfg(test)]
-pub(crate) use navigation::{call_edges_for_file, type_alias_edges};
+pub(crate) use navigation::type_alias_edges;
 pub(crate) use references::{
     normalize_validated_rename, reference_locations, rename_edits, resolve_symbol_at,
     symbol_spans_for_file,

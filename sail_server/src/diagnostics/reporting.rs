@@ -142,12 +142,8 @@ pub(crate) fn render_message(file: &File, message: &Message) -> String {
 // Diagnostic construction helpers
 // ---------------------------------------------------------------------------
 
-// Keep the full upstream-style error surface even though the current LSP
-// only constructs a subset of these variants.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Error {
-    General { span: Span, message: String },
-    Todo { span: Span, message: String },
     Syntax { span: Span, message: String },
     Lex { span: Span, message: String },
     Type { span: Span, error: TypeError },
@@ -170,9 +166,6 @@ fn message_with_hint(message: String, hint: Option<String>) -> String {
 
 pub(crate) fn diagnostic_for_error(file: &File, code: DiagnosticCode, error: Error) -> Diagnostic {
     match error {
-        Error::General { span, message } | Error::Todo { span, message } => {
-            Diagnostic::new(code, message, range(file, span), Severity::Error)
-        }
         Error::Syntax { span, message } => {
             Diagnostic::new(code, message, range(file, span), Severity::Error)
         }

@@ -19,39 +19,6 @@ pub(crate) struct CallEdge {
     pub(crate) call_range: Range,
 }
 
-pub(crate) fn call_edges_for_file(uri: &Url, file: &File) -> Vec<CallEdge> {
-    let Some(parsed) = file.parsed() else {
-        return Vec::new();
-    };
-    parsed
-        .call_sites
-        .iter()
-        .filter_map(|call| {
-            let caller = call.caller.clone()?;
-            Some(CallEdge {
-                caller,
-                caller_uri: uri.clone(),
-                callee: call.callee.clone(),
-                call_range: Range::new(
-                    file.source.position_at(call.callee_span.start),
-                    file.source.position_at(call.callee_span.end),
-                ),
-            })
-        })
-        .collect()
-}
-
-pub(crate) fn call_edges<'a, I>(files: I) -> Vec<CallEdge>
-where
-    I: IntoIterator<Item = (&'a Url, &'a File)>,
-{
-    let mut out = Vec::new();
-    for (uri, file) in files {
-        out.extend(call_edges_for_file(uri, file));
-    }
-    out
-}
-
 /// Collect call edges where the callee matches `target`, skipping unrelated edges.
 pub(crate) fn call_edges_to<'a, I>(files: I, target: &str) -> Vec<CallEdge>
 where

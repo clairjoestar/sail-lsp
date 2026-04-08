@@ -1087,13 +1087,14 @@ fn builds_selection_range_chain() {
 
 #[test]
 fn builds_call_edges_for_file() {
+    use crate::symbols::call_edges_to;
     let source = r#"
 function foo(x) = bar(x)
 function bar(x) = x
 "#;
     let file = File::new(source.to_string());
     let uri = Url::parse("file:///tmp/test.sail").unwrap();
-    let edges = call_edges_for_file(&uri, &file);
+    let edges = call_edges_to([(&uri, &file)].into_iter(), "bar");
     assert!(edges.iter().any(|e| e.caller == "foo" && e.callee == "bar"));
 }
 
