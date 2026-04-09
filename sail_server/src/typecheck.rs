@@ -16,6 +16,40 @@ use sail_parser::{
 
 type SpanKey = (usize, usize);
 
+/// Nullary/unary constructors from the upstream Sail standard library
+/// (`sail/lib/option.sail`, `sail/lib/result.sail`). We whitelist them so
+/// pattern-binding disambiguation and the unresolved-identifier check
+/// don't misclassify legitimate uses just because the upstream prelude
+/// isn't in the parsed corpus.
+const PRELUDE_CONSTRUCTORS: &[&str] = &["None", "Some", "Ok", "Err"];
+
+/// Compiler intrinsics handled in `sail/src/lib/initial_check.ml`; they
+/// parse as bare `Expr::Ident` but are always resolved by the frontend.
+const PRELUDE_INTRINSICS: &[&str] = &["__FILE__", "__LINE__"];
+
+/// Enum members defined in upstream Sail library files that projects
+/// rely on without explicitly including them. Currently just the
+/// concurrency interface (`sail/lib/concurrency_interface/read_write_v1.sail`),
+/// which sail-riscv references via its `phys_mem_interface.sail`.
+const PRELUDE_ENUM_MEMBERS: &[&str] = &[
+    // enum Access_variety
+    "AV_plain",
+    "AV_exclusive",
+    "AV_atomic_rmw",
+    // enum Access_strength
+    "AS_normal",
+    "AS_rel_or_acq",
+    "AS_acq_rcpc",
+];
+
+/// Names that should count as defined for the workspace-aware
+/// unresolved-identifier check.
+fn is_prelude_value(name: &str) -> bool {
+    PRELUDE_CONSTRUCTORS.contains(&name)
+        || PRELUDE_INTRINSICS.contains(&name)
+        || PRELUDE_ENUM_MEMBERS.contains(&name)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Ty {
     Unknown,
@@ -77,6 +111,25 @@ struct TopLevelEnv {
     /// Names of union/enum constructors defined in other files. Used to
     /// recognize bare-identifier patterns as constructors.
     cross_file_constructor_names: HashSet<String>,
+    /// Names of top-level `let`/`var`/register/enum-member bindings
+    /// defined in other workspace files. Used by the unresolved-identifier
+    /// check to decide whether a bare `Expr::Ident` is plausibly defined
+    /// elsewhere.
+    cross_file_value_names: HashSet<String>,
+    /// Names of registers defined in other workspace files. Used by the
+    /// unresolved-identifier check for `Expr::Ref`.
+    cross_file_register_names: HashSet<String>,
+    /// Names of bitfield/struct fields visible in the current workspace.
+    /// These appear as bare `Expr::Ident`s inside the synthetic
+    /// `vector_access#(base, field)` call that lowered `v[field]`, so the
+    /// unresolved-identifier check would otherwise flag them. Populated
+    /// from both the local file and the workspace pass.
+    known_field_names: HashSet<String>,
+    /// True iff this env was built with `check_file_with_workspace`, i.e.
+    /// the cross_file_* sets reflect the full workspace. The strict
+    /// unresolved-identifier check only runs when this is true, so that
+    /// single-file mode (which has no cross-file knowledge) stays lenient.
+    has_workspace_context: bool,
     global_constraints: Vec<ConstraintExpr>,
     vector_order: VectorOrder,
 }
@@ -217,6 +270,10 @@ impl Default for TopLevelEnv {
             type_aliases: HashMap::new(),
             cross_file_function_names: HashSet::new(),
             cross_file_constructor_names: HashSet::new(),
+            cross_file_value_names: HashSet::new(),
+            cross_file_register_names: HashSet::new(),
+            known_field_names: HashSet::new(),
+            has_workspace_context: false,
             global_constraints: Vec::new(),
             vector_order: VectorOrder::Dec,
         }
@@ -760,15 +817,30 @@ fn is_known_non_record(ty: &Ty) -> bool {
     }
 }
 
-fn is_pattern_binding(name: &str, pattern_constants: &HashSet<String>) -> bool {
+/// Decides whether `name` in a pattern position should be treated as a
+/// variable binding (`true`) or as a nullary constructor match (`false`).
+///
+/// When `workspace_known_constructors` is true, `pattern_constants` is the
+/// authoritative list of every constructor visible to the current file
+/// (local + cross-file + upstream prelude), so we trust it completely: if
+/// the name isn't in the set, it must be a binding. Without that guarantee
+/// we fall back on the uppercase-is-constructor convention to avoid
+/// spurious "Duplicate binding for Data" errors from upstream constructors
+/// the single-file checker can't see.
+fn is_pattern_binding(
+    name: &str,
+    pattern_constants: &HashSet<String>,
+    workspace_known_constructors: bool,
+) -> bool {
     if pattern_constants.contains(name) {
         return false;
     }
-    // Identifiers starting with an uppercase letter are conventionally
-    // constructors in Sail (e.g. `Some`, `None`, `Data`, `ShadowStack`).
-    // Without cross-file type info, treat them as constructors rather than
-    // bindings to avoid false positives like "Duplicate binding for Data".
-    if name.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+    if PRELUDE_CONSTRUCTORS.contains(&name) {
+        return false;
+    }
+    if !workspace_known_constructors
+        && name.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+    {
         return false;
     }
     true
@@ -833,6 +905,9 @@ impl TopLevelEnv {
                     }
                     NamedDefKind::Struct => {
                         if let Some(NamedDefDetail::Struct { fields }) = &def.detail {
+                            for field in fields {
+                                env.known_field_names.insert(field.0.name.0.clone());
+                            }
                             env.records.insert(
                                 def.name.0.clone(),
                                 RecordInfo {
@@ -868,6 +943,9 @@ impl TopLevelEnv {
                                 .iter()
                                 .map(|(name, ty)| (name.clone(), ty.clone()))
                                 .collect::<Vec<_>>();
+                            for (field_name, _) in &field_entries {
+                                env.known_field_names.insert(field_name.clone());
+                            }
                             env.bitfields.insert(def.name.0.clone(), info.clone());
                             for (field_name, field_ty) in field_entries {
                                 synthesize_bitfield_accessors(
@@ -910,10 +988,16 @@ impl TopLevelEnv {
                         }
                     }
                     NamedDefKind::Let | NamedDefKind::Var => {
-                        if let Some(ty) = &def.ty {
-                            env.values
-                                .insert(def.name.0.clone(), type_from_type_expr(source, ty));
-                        }
+                        // Record the binding even without a type annotation
+                        // so `top_level_symbol_exists` (and `lookup_value`)
+                        // knows it's a defined name. Common case: sail-riscv's
+                        // `let xlen = sizeof(xlen)` in core/xlen.sail.
+                        let ty = def
+                            .ty
+                            .as_ref()
+                            .map(|t| type_from_type_expr(source, t))
+                            .unwrap_or(Ty::Unknown);
+                        env.values.insert(def.name.0.clone(), ty);
                     }
                     _ => {}
                 },
@@ -972,6 +1056,30 @@ impl TopLevelEnv {
                 None => return current,
             }
         }
+    }
+
+    /// Returns true if `name` is a plausible top-level symbol in the
+    /// current env — local file definitions, aggregated cross-file names,
+    /// or a well-known upstream prelude name. Used by the strict
+    /// unresolved-identifier check; intentionally permissive (we'd rather
+    /// miss a bug than emit a false positive).
+    fn top_level_symbol_exists(&self, name: &str) -> bool {
+        if is_prelude_value(name) {
+            return true;
+        }
+        self.values.contains_key(name)
+            || self.functions.contains_key(name)
+            || self.constructors.contains_key(name)
+            || self.registers.contains_key(name)
+            || self.records.contains_key(name)
+            || self.bitfields.contains_key(name)
+            || self.type_aliases.contains_key(name)
+            || self.overloads.contains_key(name)
+            || self.cross_file_function_names.contains(name)
+            || self.cross_file_constructor_names.contains(name)
+            || self.cross_file_value_names.contains(name)
+            || self.cross_file_register_names.contains(name)
+            || self.known_field_names.contains(name)
     }
 
     fn lookup_value(&self, locals: &LocalEnv, name: &str) -> Option<Ty> {
@@ -1274,6 +1382,12 @@ fn apply_callable_signature_metadata(file: &File, env: &mut TopLevelEnv) {
         }
     }
 
+    // Sort by key so iteration order is stable — otherwise HashMap's
+    // randomized hasher can cause `check_file_with_workspace` to observe
+    // a different scheme shape on different runs (e.g. tuple-flattened
+    // vs. not) and emit different `Unresolved identifier` diagnostics.
+    let mut best_signatures: Vec<_> = best_signatures.into_iter().collect();
+    best_signatures.sort_by(|a, b| a.0.cmp(&b.0));
     for ((name, _), (_, implicit_params, signature_params, return_type)) in best_signatures {
         let Some(schemes) = env.functions.get_mut(&name) else {
             continue;
@@ -4223,7 +4337,7 @@ impl<'a> Checker<'a> {
                 self.collect_pattern_prebindings(pattern, bindings, subranges);
             }
             Pattern::Ident(name) => {
-                if is_pattern_binding(name, &self.pattern_constants) {
+                if is_pattern_binding(name, &self.pattern_constants, self.env.has_workspace_context) {
                     self.note_pattern_binding(name, pattern.1, bindings);
                 }
             }
@@ -4241,7 +4355,7 @@ impl<'a> Checker<'a> {
                 }
             }
             Pattern::Index { name, index } => {
-                if !is_pattern_binding(&name.0, &self.pattern_constants) {
+                if !is_pattern_binding(&name.0, &self.pattern_constants, self.env.has_workspace_context) {
                     self.push_error(
                         DiagnosticCode::TypeError,
                         name.1,
@@ -4261,7 +4375,7 @@ impl<'a> Checker<'a> {
                 }
             }
             Pattern::RangeIndex { name, start, end } => {
-                if !is_pattern_binding(&name.0, &self.pattern_constants) {
+                if !is_pattern_binding(&name.0, &self.pattern_constants, self.env.has_workspace_context) {
                     self.push_error(
                         DiagnosticCode::TypeError,
                         name.1,
@@ -4386,7 +4500,7 @@ impl<'a> Checker<'a> {
                 self.collect_pattern_binding_name_spans(pattern, out);
             }
             Pattern::Ident(name) => {
-                if is_pattern_binding(name, &self.pattern_constants) {
+                if is_pattern_binding(name, &self.pattern_constants, self.env.has_workspace_context) {
                     out.entry(name.clone()).or_insert(pattern.1);
                 }
             }
@@ -4404,7 +4518,7 @@ impl<'a> Checker<'a> {
                 }
             }
             Pattern::Index { name, .. } | Pattern::RangeIndex { name, .. } => {
-                if is_pattern_binding(&name.0, &self.pattern_constants) {
+                if is_pattern_binding(&name.0, &self.pattern_constants, self.env.has_workspace_context) {
                     out.entry(name.0.clone()).or_insert(name.1);
                 }
             }
@@ -5643,7 +5757,21 @@ impl<'a> Checker<'a> {
     ) {
         let mut locals = LocalEnv::new(expected_scheme.map(|scheme| scheme.ret.clone()));
         if let Some(scheme) = expected_scheme {
-            for (pattern, expected_ty) in clause.0.patterns.iter().zip(scheme.params.iter()) {
+            // A `val f : (A, B) -> C` declaration gives a single tuple
+            // param, but the clause can be written as `function clause
+            // f(a, b) = ...` with two separate patterns. Flatten the
+            // tuple so each pattern gets bound with its matching type —
+            // otherwise `b` above would never enter locals and every
+            // reference to it would fire as "Unresolved identifier".
+            let mut param_tys = scheme.params.clone();
+            if param_tys.len() == 1 && clause.0.patterns.len() > 1 {
+                if let Ty::Tuple(items) = &param_tys[0] {
+                    if items.len() == clause.0.patterns.len() {
+                        param_tys = items.clone();
+                    }
+                }
+            }
+            for (pattern, expected_ty) in clause.0.patterns.iter().zip(param_tys.iter()) {
                 self.bind_pattern(pattern, Some(expected_ty.clone()), &mut locals);
             }
         } else {
@@ -5897,7 +6025,7 @@ impl<'a> Checker<'a> {
                 self.bind_pattern_inner(pattern, expected_ty, locals);
             }
             Pattern::Ident(name) => {
-                if is_pattern_binding(name, &self.pattern_constants) {
+                if is_pattern_binding(name, &self.pattern_constants, self.env.has_workspace_context) {
                     let ty = expected_ty.unwrap_or(Ty::Unknown);
                     locals.define(name, ty.clone());
                     self.record_binding_type(pattern.1, &ty);
@@ -6212,7 +6340,17 @@ impl<'a> Checker<'a> {
                     self.expect_type(pattern.1, &actual, expected);
                 }
             }
-            Pattern::Wild | Pattern::TypeVar(_) | Pattern::Error(_) => {}
+            Pattern::TypeVar(name) => {
+                // `let 'X = e` in Sail simultaneously binds the type
+                // variable `'X` and a value `X` (without the tick). The
+                // lexer currently carries the leading `'` through, so
+                // strip it before defining the value binding.
+                let value_name = name.strip_prefix('\'').unwrap_or(name);
+                let ty = expected_ty.unwrap_or(Ty::Unknown);
+                locals.define(value_name, ty.clone());
+                self.record_binding_type(pattern.1, &ty);
+            }
+            Pattern::Wild | Pattern::Error(_) => {}
         }
     }
 
@@ -6571,9 +6709,23 @@ impl<'a> Checker<'a> {
                 if let Some(ty) = self.env.lookup_value(locals, name) {
                     ty
                 } else {
-                    // Cross-file constants/registers/enum members aren't visible
-                    // to the local type-check environment. Silently return Unknown
-                    // to avoid false-positive "Identifier unbound" errors.
+                    // Under workspace-aware analysis, if a bare identifier
+                    // isn't known anywhere in the workspace (cross-file
+                    // values/functions/constructors/registers/enum-members
+                    // or the upstream prelude whitelist), it's a genuine
+                    // unresolved reference — report it. In single-file mode
+                    // the cross-file sets are empty, so we stay silent to
+                    // avoid a flood of false positives.
+                    if self.env.has_workspace_context
+                        && !self.env.top_level_symbol_exists(name)
+                        && !self.pattern_constants.contains(name)
+                    {
+                        self.push_error(
+                            DiagnosticCode::TypeError,
+                            expr.1,
+                            TypeError::Other(format!("Unresolved identifier `{name}`")),
+                        );
+                    }
                     Ty::Unknown
                 }
             }
@@ -6582,7 +6734,19 @@ impl<'a> Checker<'a> {
                 if let Some(ty) = self.register_type_for_name(&name.0) {
                     register_ty(ty)
                 } else {
-                    // Cross-file registers aren't visible — silently return Unknown.
+                    // `&reg` must refer to a register. Report only when
+                    // workspace context is active and the name is not a
+                    // register anywhere.
+                    if self.env.has_workspace_context
+                        && !self.env.registers.contains_key(&name.0)
+                        && !self.env.cross_file_register_names.contains(&name.0)
+                    {
+                        self.push_error(
+                            DiagnosticCode::TypeError,
+                            name.1,
+                            TypeError::Other(format!("Unresolved register `{}`", name.0)),
+                        );
+                    }
                     Ty::Unknown
                 }
             }
@@ -7603,8 +7767,13 @@ where
     //   - pattern constants (enum members)
     //   - cross-file function names (for existence checks only)
     //   - cross-file constructor names (for pattern recognition only)
+    //   - cross-file value names (let/var/register/enum-member bindings,
+    //     used by the unresolved-identifier check)
+    //   - cross-file register names (for the `&reg` unresolved check)
     let mut cross_file_function_names: HashSet<String> = HashSet::new();
     let mut cross_file_constructor_names: HashSet<String> = HashSet::new();
+    let mut cross_file_value_names: HashSet<String> = HashSet::new();
+    let mut cross_file_register_names: HashSet<String> = HashSet::new();
     for f in all_files {
         let Some(other_ast) = f.core_ast() else { continue };
         for (item, _) in &other_ast.defs {
@@ -7625,10 +7794,12 @@ where
                     NamedDefKind::Enum => {
                         for member in &def.members {
                             pattern_constants.insert(member.0.clone());
+                            cross_file_value_names.insert(member.0.clone());
                         }
                         if let Some(NamedDefDetail::Enum { members, .. }) = &def.detail {
                             for m in members {
                                 pattern_constants.insert(m.0.name.0.clone());
+                                cross_file_value_names.insert(m.0.name.0.clone());
                             }
                         }
                     }
@@ -7639,6 +7810,27 @@ where
                             }
                         }
                     }
+                    NamedDefKind::Register => {
+                        cross_file_register_names.insert(def.name.0.clone());
+                        cross_file_value_names.insert(def.name.0.clone());
+                    }
+                    NamedDefKind::Let | NamedDefKind::Var => {
+                        cross_file_value_names.insert(def.name.0.clone());
+                    }
+                    NamedDefKind::Struct => {
+                        if let Some(NamedDefDetail::Struct { fields }) = &def.detail {
+                            for field in fields {
+                                env.known_field_names.insert(field.0.name.0.clone());
+                            }
+                        }
+                    }
+                    NamedDefKind::Bitfield => {
+                        if let Some(NamedDefDetail::Bitfield { fields }) = &def.detail {
+                            for field in fields {
+                                env.known_field_names.insert(field.0.name.0.clone());
+                            }
+                        }
+                    }
                     NamedDefKind::Overload => {
                         let entry = env.overloads.entry(def.name.0.clone()).or_default();
                         for m in &def.members {
@@ -7646,6 +7838,9 @@ where
                                 entry.push(m.0.clone());
                             }
                         }
+                        // Overload names themselves look like callable
+                        // targets, so treat them as function-like.
+                        cross_file_function_names.insert(def.name.0.clone());
                     }
                     _ => {}
                 }
@@ -7653,6 +7848,7 @@ where
                     if matches!(def.kind, sail_parser::ScatteredClauseKind::Enum) =>
                 {
                     pattern_constants.insert(def.member.0.clone());
+                    cross_file_value_names.insert(def.member.0.clone());
                 }
                 _ => {}
             }
@@ -7668,6 +7864,9 @@ where
     // Stash the cross-file name sets for use by infer_call's existence check.
     env.cross_file_function_names = cross_file_function_names;
     env.cross_file_constructor_names = cross_file_constructor_names;
+    env.cross_file_value_names = cross_file_value_names;
+    env.cross_file_register_names = cross_file_register_names;
+    env.has_workspace_context = true;
 
     Some(Checker::new(file, env, pattern_constants).check_source_file(ast))
 }
