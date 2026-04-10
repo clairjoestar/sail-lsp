@@ -13,10 +13,21 @@ pub(crate) struct State {
     pub(crate) diagnostic_versions: HashMap<Url, i32>,
     pub(crate) semantic_tokens_cache: HashMap<Url, SemanticTokens>,
     pub(crate) disk_scan_generation: u64,
+    /// Set to `true` once at least one workspace scan has finished
+    /// populating `disk_files`. Until then, the typecheck snapshot may be
+    /// missing most of the workspace, so the strict unresolved-identifier
+    /// check has to stay disabled — otherwise every cross-file reference
+    /// would fire as `Unresolved identifier` until the scan races in.
+    pub(crate) workspace_scan_complete: bool,
     /// Per-URI generation counter for typecheck tasks. Incremented each time a
     /// new typecheck is scheduled so that stale in-flight workers can detect
     /// they have been superseded and bail out early.
     pub(crate) typecheck_generation: HashMap<Url, u64>,
+    /// Per-URI cancellation token for the in-flight typecheck worker. When
+    /// a new typecheck is scheduled, the previous token is flipped to
+    /// cancelled so the doomed worker stops at the next definition
+    /// boundary instead of running to completion.
+    pub(crate) typecheck_cancel: HashMap<Url, crate::typecheck::CancellationToken>,
 }
 
 impl State {
@@ -28,13 +39,17 @@ impl State {
     }
 
     /// Look up a file by URI, preferring open files over disk files.
+    /// Disk files are lazily loaded + parsed on first access.
     pub(crate) fn get_file(&self, uri: &Url) -> Option<&File> {
         self.open_files
             .get(uri)
             .or_else(|| self.disk_files.get_file(uri))
     }
 
-    /// Get all the files, ignoring files on disk that are also open.
+    /// Iterate every file (open + disk) once, with open files shadowing
+    /// their disk counterparts. Disk files are lazily parsed on first
+    /// touch via the per-slot `OnceLock`, so a workspace with 158 files
+    /// only pays parse cost for the files actually iterated.
     pub(crate) fn all_files(&self) -> impl Iterator<Item = (&Url, &File)> {
         self.open_files.iter().chain(
             self.disk_files
@@ -210,13 +225,32 @@ impl Backend {
                 }
             };
 
-            let applied = {
+            let (applied, refresh_uris): (bool, Vec<(Url, i32, File)>) = {
                 let mut state_guard = state.write().await;
                 if state_guard.disk_scan_generation != generation {
-                    false
+                    (false, Vec::new())
                 } else {
                     state_guard.disk_files.update(files);
-                    true
+                    state_guard.workspace_scan_complete = true;
+                    // Re-snapshot every open file so we can re-run their
+                    // typecheck against the freshly populated workspace.
+                    // Without this, files opened before the scan finished
+                    // would keep showing the lenient pre-scan diagnostics
+                    // (or, if the strict check ever ran, a flood of false
+                    // "Unresolved identifier" errors).
+                    let refresh = state_guard
+                        .open_files
+                        .iter()
+                        .map(|(uri, file)| {
+                            let version = state_guard
+                                .diagnostic_versions
+                                .get(uri)
+                                .copied()
+                                .unwrap_or(0);
+                            (uri.clone(), version, file.clone())
+                        })
+                        .collect();
+                    (true, refresh)
                 }
             };
 
@@ -225,18 +259,45 @@ impl Backend {
                     .log_message(MessageType::INFO, "workspace scan completed")
                     .await;
             }
+
+            // Schedule a fresh typecheck for every currently open file so
+            // they immediately reflect the now-complete workspace context.
+            if applied {
+                for (uri, version, file) in refresh_uris {
+                    spawn_debounced_typecheck(state.clone(), client.clone(), uri, version, file);
+                }
+            }
         });
     }
 
     pub(crate) fn schedule_debounced_typecheck(&self, uri: Url, version: i32, file: File) {
-        let state = self.state.clone();
-        let client = self.client.clone();
-        tokio::spawn(async move {
+        spawn_debounced_typecheck(self.state.clone(), self.client.clone(), uri, version, file);
+    }
+}
+
+pub(crate) fn spawn_debounced_typecheck(
+    state: Arc<RwLock<State>>,
+    client: Client,
+    uri: Url,
+    version: i32,
+    file: File,
+) {
+    tokio::spawn(async move {
             // Bump the generation counter so any previously-spawned typecheck
-            // for this URI knows it has been superseded.
-            let generation = {
+            // for this URI knows it has been superseded, and install a fresh
+            // cancellation token, cancelling the previous one so its in-flight
+            // worker stops at the next definition boundary instead of running
+            // to completion.
+            let (generation, cancel) = {
                 let mut state_guard = state.write().await;
-                state_guard.next_typecheck_generation(&uri)
+                let generation = state_guard.next_typecheck_generation(&uri);
+                let cancel = crate::typecheck::CancellationToken::new();
+                if let Some(prev) =
+                    state_guard.typecheck_cancel.insert(uri.clone(), cancel.clone())
+                {
+                    prev.cancel();
+                }
+                (generation, cancel)
             };
 
             tokio::time::sleep(Duration::from_millis(TYPECHECK_DEBOUNCE_MS)).await;
@@ -254,22 +315,33 @@ impl Backend {
             }
 
             // Snapshot all files (open + disk) so the worker thread can do
-            // cross-file analysis without holding the state lock.
-            let workspace_files: Vec<File> = {
+            // cross-file analysis without holding the state lock. Also
+            // capture whether the disk scan has completed — until it has,
+            // the snapshot may be missing most of the workspace, so the
+            // strict unresolved-identifier check has to stay disabled.
+            let (workspace_files, workspace_complete): (Vec<File>, bool) = {
                 let state_guard = state.read().await;
-                state_guard.all_files().map(|(_, f)| f.clone()).collect()
+                (
+                    state_guard.all_files().map(|(_, f)| f.clone()).collect(),
+                    state_guard.workspace_scan_complete,
+                )
             };
 
             // Run typecheck AND workspace-aware semantic recompute in the
             // worker thread so they can both use the cross-file context.
             let (tx, rx) = oneshot::channel();
             let workspace_for_thread = workspace_files;
+            let cancel_for_thread = cancel.clone();
             let spawn_result = std::thread::Builder::new()
                 .name("sail-typecheck".to_string())
                 .stack_size(TYPECHECK_THREAD_STACK_SIZE)
                 .spawn(move || {
                     let mut file = file;
-                    file.recompute_diagnostics_with_workspace(&workspace_for_thread);
+                    file.recompute_diagnostics_with_workspace(
+                        &workspace_for_thread,
+                        workspace_complete,
+                        cancel_for_thread,
+                    );
                     let _ = tx.send(file);
                 });
 
@@ -287,8 +359,12 @@ impl Backend {
             };
 
             // After typecheck completes, verify this task is still the latest
-            // before committing the result into state.
-            let diagnostics = {
+            // before committing the result into state. Also collect a list
+            // of dependent open files whose typecheck should be refreshed:
+            // any open file (other than this one) that referenced one of
+            // F's top-level symbol names. This is the lightweight reverse-
+            // dependency analogue of salsa's automatic invalidation.
+            let (diagnostics, dependents): (Option<Vec<_>>, Vec<(Url, i32, File)>) = {
                 let mut state_guard = state.write().await;
                 if state_guard.typecheck_generation.get(&uri).copied() != Some(generation) {
                     return;
@@ -302,12 +378,58 @@ impl Backend {
                 if let Some(updated) = updated_file {
                     *file = updated;
                 }
-                Some(file.lsp_diagnostics())
+                let diagnostics = Some(file.lsp_diagnostics());
+
+                // Collect names of every top-level definition exported by
+                // the file we just rechecked. These are the symbols whose
+                // signatures might have changed shape.
+                let exported_names: std::collections::HashSet<String> = file
+                    .signature_index
+                    .keys()
+                    .cloned()
+                    .chain(file.definitions.keys().cloned())
+                    .collect();
+
+                // Find every other open file that references one of those
+                // names in its parsed symbol occurrences. Snapshot the
+                // (uri, version, File) so we can hand them to the
+                // background scheduler without holding the write lock.
+                let dependents: Vec<(Url, i32, File)> = state_guard
+                    .open_files
+                    .iter()
+                    .filter(|(other_uri, _)| **other_uri != uri)
+                    .filter_map(|(other_uri, other_file)| {
+                        let parsed = other_file.parsed()?;
+                        let touches = parsed
+                            .symbol_occurrences
+                            .iter()
+                            .any(|occ| exported_names.contains(&occ.name));
+                        if touches {
+                            let v = state_guard
+                                .diagnostic_versions
+                                .get(other_uri)
+                                .copied()
+                                .unwrap_or(0);
+                            Some((other_uri.clone(), v, other_file.clone()))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                (diagnostics, dependents)
             };
 
             if let Some(diagnostics) = diagnostics {
-                client.publish_diagnostics(uri, diagnostics, None).await;
+                client.publish_diagnostics(uri.clone(), diagnostics, None).await;
+            }
+
+            // Reschedule dependent open files. Each call goes through the
+            // normal debounce + cancellation pipeline, so a rapid edit
+            // burst on F won't generate a thundering herd — only the
+            // latest reschedule for each dependent survives.
+            for (dep_uri, dep_version, dep_file) in dependents {
+                spawn_debounced_typecheck(state.clone(), client.clone(), dep_uri, dep_version, dep_file);
             }
         });
-    }
 }

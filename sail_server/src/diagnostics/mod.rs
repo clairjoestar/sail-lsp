@@ -55,6 +55,11 @@ pub enum DiagnosticCode {
     UnionConstructorInPattern,
     RedundantTypeAnnotation,
     IncompleteMatch,
+    // Reserved for the redundant-arm phase of the pattern checker.
+    // Currently suppressed at the typechecker emission layer because we
+    // don't yet model list/struct/vector patterns precisely enough to
+    // avoid false positives on the sail-riscv corpus.
+    #[allow(dead_code)]
     RedundantMatchArm,
     IncompleteScattered,
     UnknownDirective,

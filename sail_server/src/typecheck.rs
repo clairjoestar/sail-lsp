@@ -1,10 +1,52 @@
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+
+use smallvec::SmallVec;
 
 use crate::diagnostics::reporting::{diagnostic_for_error, Error as ReportingError};
 use crate::diagnostics::type_error::{TypeError, VectorOrder};
-use crate::diagnostics::{Diagnostic, DiagnosticCode};
+use crate::diagnostics::{Diagnostic, DiagnosticCode, Severity};
+use crate::match_check::{self, EnvCx, MatchTy};
 use crate::state::File;
 use crate::symbols::collect_callable_signatures;
+
+/// Cooperative cancellation token threaded through the type checker.
+///
+/// The worker that schedules a typecheck can flip this to `true` when a
+/// newer typecheck is queued for the same file; the in-flight checker
+/// notices at the next per-definition checkpoint and bails out early
+/// instead of burning CPU on a result that will be discarded.
+///
+/// This is a much weaker analogue of salsa's `Cancelled` exception, but
+/// it's enough to keep typing latency from piling up doomed work.
+#[derive(Clone, Debug, Default)]
+pub struct CancellationToken {
+    inner: Arc<AtomicBool>,
+}
+
+impl CancellationToken {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Returns a token that can never be cancelled. Tests and one-shot
+    /// callers use this so they don't have to thread a real token.
+    pub fn never() -> Self {
+        Self::default()
+    }
+
+    pub fn cancel(&self) {
+        self.inner.store(true, Ordering::Release);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.inner.load(Ordering::Acquire)
+    }
+}
 use sail_parser::{
     core_ast::{
         BitfieldField, Call, CallableClause, CallableDefKind, DefinitionKind, Expr, FieldExpr,
@@ -50,15 +92,29 @@ fn is_prelude_value(name: &str) -> bool {
         || PRELUDE_ENUM_MEMBERS.contains(&name)
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum Ty {
+/// Type representation. The outer `Ty` is a thin newtype wrapping
+/// `Arc<TyData>`, so cloning is one refcount bump regardless of how
+/// large the type tree is. This is the C1 (interning) refactor: it
+/// gives us cheap clones along the substitution / unification hot path
+/// AND a fast-path for equality (`Arc::ptr_eq`) when two `Ty` values
+/// happen to share the same allocation.
+///
+/// We deliberately use `kind()` instead of `Deref` so callers see the
+/// indirection and can't accidentally turn `ty.clone()` into a deep
+/// clone of `TyData`.
+///
+/// Note that `Function::ret` and `TyArg::Type` previously held
+/// `Box<Ty>`. With the newtype `Ty` already containing an `Arc`,
+/// the extra `Box` is redundant and has been removed.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum TyData {
     Unknown,
     Text(String),
     Var(String),
     Tuple(Vec<Ty>),
     Function {
         params: Vec<Ty>,
-        ret: Box<Ty>,
+        ret: Ty,
     },
     App {
         name: String,
@@ -67,9 +123,105 @@ enum Ty {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Eq)]
+struct Ty(Arc<TyData>);
+
+impl PartialEq for Ty {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0) || *self.0 == *other.0
+    }
+}
+
+impl std::hash::Hash for Ty {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
+}
+
+/// Tiny intern pool for the primitives every Sail program uses dozens of
+/// times. Returning a shared `Arc` for these names means `Ty == Ty` on
+/// `int` / `bool` / `unit` / etc. hits the `Arc::ptr_eq` fast path.
+struct PrimitiveTyPool {
+    unknown: Ty,
+    int: Ty,
+    nat: Ty,
+    bool_: Ty,
+    unit: Ty,
+    bit: Ty,
+    string: Ty,
+    real: Ty,
+}
+
+fn primitive_pool() -> &'static PrimitiveTyPool {
+    static POOL: OnceLock<PrimitiveTyPool> = OnceLock::new();
+    POOL.get_or_init(|| PrimitiveTyPool {
+        unknown: Ty(Arc::new(TyData::Unknown)),
+        int: Ty(Arc::new(TyData::Text("int".to_string()))),
+        nat: Ty(Arc::new(TyData::Text("nat".to_string()))),
+        bool_: Ty(Arc::new(TyData::Text("bool".to_string()))),
+        unit: Ty(Arc::new(TyData::Text("unit".to_string()))),
+        bit: Ty(Arc::new(TyData::Text("bit".to_string()))),
+        string: Ty(Arc::new(TyData::Text("string".to_string()))),
+        real: Ty(Arc::new(TyData::Text("real".to_string()))),
+    })
+}
+
+impl Ty {
+    fn kind(&self) -> &TyData {
+        &self.0
+    }
+
+    fn unknown() -> Self {
+        primitive_pool().unknown.clone()
+    }
+
+    fn text<S: Into<String>>(s: S) -> Self {
+        let s = s.into();
+        // Hot-path interning for the seven primitives.
+        let pool = primitive_pool();
+        match s.as_str() {
+            "int" => pool.int.clone(),
+            "nat" => pool.nat.clone(),
+            "bool" => pool.bool_.clone(),
+            "unit" => pool.unit.clone(),
+            "bit" => pool.bit.clone(),
+            "string" => pool.string.clone(),
+            "real" => pool.real.clone(),
+            _ => Ty(Arc::new(TyData::Text(s))),
+        }
+    }
+
+    fn var<S: Into<String>>(s: S) -> Self {
+        Ty(Arc::new(TyData::Var(s.into())))
+    }
+
+    fn tuple(items: Vec<Ty>) -> Self {
+        Ty(Arc::new(TyData::Tuple(items)))
+    }
+
+    fn function(params: Vec<Ty>, ret: Ty) -> Self {
+        Ty(Arc::new(TyData::Function { params, ret }))
+    }
+
+    fn app<N: Into<String>, T: Into<String>>(name: N, args: Vec<TyArg>, text: T) -> Self {
+        Ty(Arc::new(TyData::App {
+            name: name.into(),
+            args,
+            text: text.into(),
+        }))
+    }
+}
+
+// Compatibility shim: `Ty::unknown()`, `Ty::text(...)`, etc. were the old
+// constructor namespaces. The atomic cutover replaces them with
+// `Ty::unknown()` / `Ty::text(...)` / `Ty::tuple(...)` / etc. and replaces
+// every match arm with `match ty.kind() { TyData::... }`.
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum TyArg {
-    Type(Box<Ty>),
+    // `Ty` already contains an `Arc`, so the previous `Box<Ty>` was
+    // double-indirection. Folded the box.
+    Type(Ty),
     Value(String),
 }
 
@@ -92,14 +244,27 @@ struct MappingScheme {
 
 #[derive(Clone, Debug)]
 struct TopLevelEnv {
-    functions: HashMap<String, Vec<TypeScheme>>,
-    mappings: HashMap<String, Vec<MappingScheme>>,
+    // Schemes are stored as `Arc<Scheme>` so `lookup_*` can return cheap
+    // refcount-bumped owned handles. This avoids the borrow-vs-mutate
+    // dance you otherwise hit when iterating candidates while needing
+    // `&mut self` to push diagnostics, and it makes per-call lookup
+    // allocation-free in the common (non-overload) case.
+    functions: HashMap<String, Vec<Arc<TypeScheme>>>,
+    mappings: HashMap<String, Vec<Arc<MappingScheme>>>,
     overloads: HashMap<String, Vec<String>>,
     values: HashMap<String, Ty>,
     registers: HashMap<String, Ty>,
     records: HashMap<String, RecordInfo>,
     bitfields: HashMap<String, BitfieldInfo>,
-    constructors: HashMap<String, Vec<TypeScheme>>,
+    constructors: HashMap<String, Vec<Arc<TypeScheme>>>,
+    /// Type-name → enum member list. `Privilege → [Machine, Supervisor, User]`.
+    /// Populated from `NamedDefKind::Enum` definitions and merged with
+    /// cross-file enums via `WorkspaceContext::apply_to`. Used by the
+    /// pattern-exhaustiveness check to enumerate constructors per type.
+    enums: HashMap<String, Vec<String>>,
+    /// Type-name → union variant list. `option → [Some, None]`. Populated
+    /// the same way as `enums`.
+    unions: HashMap<String, Vec<String>>,
     /// Map from type alias name to its underlying type. Used to resolve
     /// cross-file aliases like `xlenbits = bits(64)` so the unify function
     /// can compare textually-different but semantically-equal types.
@@ -119,6 +284,15 @@ struct TopLevelEnv {
     /// Names of registers defined in other workspace files. Used by the
     /// unresolved-identifier check for `Expr::Ref`.
     cross_file_register_names: HashSet<String>,
+    /// Cross-file callable arities: `name → [(required, total), ...]`
+    /// for each `val`-declared overload variant we've seen workspace-
+    /// wide. Populated by `WorkspaceContext::apply_to`. `infer_call`
+    /// uses this to do *arity-only* checking on cross-file calls
+    /// without invoking the unifier (which would recurse on quantified
+    /// types and overflow the stack — see B1 history). Each entry is
+    /// `(required_args, total_args_including_implicits)`, matching the
+    /// shape of the local `count_mismatch` check.
+    cross_file_function_arity: HashMap<String, Vec<(usize, usize)>>,
     /// Names of bitfield/struct fields visible in the current workspace.
     /// These appear as bare `Expr::Ident`s inside the synthetic
     /// `vector_access#(base, field)` call that lowered `v[field]`, so the
@@ -165,10 +339,84 @@ enum LocalEnvUndo {
     AddConstraint,
 }
 
+/// Substitution maps generated by `unify` and consumed by `apply_subst`.
+///
+/// Sail substitutions almost always have ≤ 4 entries (a function takes a
+/// handful of type / numeric parameters), so a hashmap is the wrong data
+/// structure: it dwarfs the actual content with hash state and pays
+/// allocator cost on every `Subst::default()` call. We back the maps with
+/// `SmallVec<[_; 8]>` so the common case never touches the heap; the
+/// linear search is faster than `HashMap::get` for those sizes anyway.
+///
+/// The two inner fields are kept as named structs (`SubstTypes`,
+/// `SubstValues`) so existing call sites that use `subst.types.insert(...)`
+/// / `subst.values.get(...)` keep working unchanged — only the underlying
+/// representation changed, not the surface API.
 #[derive(Clone, Debug, Default)]
 struct Subst {
-    types: HashMap<String, Ty>,
-    values: HashMap<String, String>,
+    types: SubstTypes,
+    values: SubstValues,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SubstTypes {
+    entries: SmallVec<[(String, Ty); 8]>,
+}
+
+impl SubstTypes {
+    fn insert(&mut self, key: String, value: Ty) -> Option<Ty> {
+        for entry in &mut self.entries {
+            if entry.0 == key {
+                let old = std::mem::replace(&mut entry.1, value);
+                return Some(old);
+            }
+        }
+        self.entries.push((key, value));
+        None
+    }
+
+    fn get(&self, key: &str) -> Option<&Ty> {
+        self.entries
+            .iter()
+            .find_map(|(k, v)| if k == key { Some(v) } else { None })
+    }
+
+    fn contains_key(&self, key: &str) -> bool {
+        self.entries.iter().any(|(k, _)| k == key)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct SubstValues {
+    entries: SmallVec<[(String, String); 8]>,
+}
+
+impl SubstValues {
+    fn insert(&mut self, key: String, value: String) -> Option<String> {
+        for entry in &mut self.entries {
+            if entry.0 == key {
+                let old = std::mem::replace(&mut entry.1, value);
+                return Some(old);
+            }
+        }
+        self.entries.push((key, value));
+        None
+    }
+
+    fn get(&self, key: &str) -> Option<&String> {
+        self.entries
+            .iter()
+            .find_map(|(k, v)| if k == key { Some(v) } else { None })
+    }
+
+    fn contains_key(&self, key: &str) -> bool {
+        self.entries.iter().any(|(k, _)| k == key)
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -267,11 +515,14 @@ impl Default for TopLevelEnv {
             records: HashMap::new(),
             bitfields: HashMap::new(),
             constructors: HashMap::new(),
+            enums: HashMap::new(),
+            unions: HashMap::new(),
             type_aliases: HashMap::new(),
             cross_file_function_names: HashSet::new(),
             cross_file_constructor_names: HashSet::new(),
             cross_file_value_names: HashSet::new(),
             cross_file_register_names: HashSet::new(),
+            cross_file_function_arity: HashMap::new(),
             known_field_names: HashSet::new(),
             has_workspace_context: false,
             global_constraints: Vec::new(),
@@ -306,32 +557,41 @@ impl TypeCheckResult {
 }
 
 impl Ty {
-    fn text(&self) -> String {
-        match self {
-            Ty::Unknown => "_".to_string(),
-            Ty::Text(text) => text.clone(),
-            Ty::Var(name) => name.clone(),
-            Ty::Tuple(items) => format!(
+    /// Render this type as a textual form for diagnostics.
+    fn display_text(&self) -> String {
+        match self.kind() {
+            TyData::Unknown => "_".to_string(),
+            TyData::Text(text) => text.clone(),
+            TyData::Var(name) => name.clone(),
+            TyData::Tuple(items) => format!(
                 "({})",
-                items.iter().map(Ty::text).collect::<Vec<_>>().join(", ")
+                items
+                    .iter()
+                    .map(Ty::display_text)
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
-            Ty::Function { params, ret } => {
+            TyData::Function { params, ret } => {
                 let params = if params.len() == 1 {
-                    params[0].text()
+                    params[0].display_text()
                 } else {
                     format!(
                         "({})",
-                        params.iter().map(Ty::text).collect::<Vec<_>>().join(", ")
+                        params
+                            .iter()
+                            .map(Ty::display_text)
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     )
                 };
-                format!("{params} -> {}", ret.text())
+                format!("{params} -> {}", ret.display_text())
             }
-            Ty::App { text, .. } => text.clone(),
+            TyData::App { text, .. } => text.clone(),
         }
     }
 
     fn is_unknown(&self) -> bool {
-        matches!(self, Ty::Unknown)
+        matches!(self.kind(), TyData::Unknown)
     }
 }
 
@@ -449,45 +709,44 @@ fn type_arg_from_type_expr(source: &str, ty: &Spanned<TypeExpr>) -> TyArg {
         | TypeExpr::Register(_)
         | TypeExpr::Effect { .. }
         | TypeExpr::Forall { .. }
-        | TypeExpr::Existential { .. } => TyArg::Type(Box::new(type_from_type_expr(source, ty))),
+        | TypeExpr::Existential { .. } => TyArg::Type(type_from_type_expr(source, ty)),
         _ => TyArg::Value(span_text(source, ty.1).to_string()),
     }
 }
 
 fn type_from_type_expr(source: &str, ty: &Spanned<TypeExpr>) -> Ty {
     match &ty.0 {
-        TypeExpr::Named(name) => Ty::Text(name.clone()),
-        TypeExpr::TypeVar(name) => Ty::Var(name.clone()),
-        TypeExpr::Tuple(items) => Ty::Tuple(
+        TypeExpr::Named(name) => Ty::text(name.clone()),
+        TypeExpr::TypeVar(name) => Ty::var(name.clone()),
+        TypeExpr::Tuple(items) => Ty::tuple(
             items
                 .iter()
                 .map(|item| type_from_type_expr(source, item))
                 .collect(),
         ),
-        TypeExpr::Arrow { params, ret, .. } => Ty::Function {
-            params: params
+        TypeExpr::Arrow { params, ret, .. } => Ty::function(
+            params
                 .iter()
                 .map(|item| type_from_type_expr(source, item))
                 .collect(),
-            ret: Box::new(type_from_type_expr(source, ret)),
-        },
-        TypeExpr::App { callee, args } => Ty::App {
-            name: callee.0.clone(),
-            args: args
-                .iter()
+            type_from_type_expr(source, ret),
+        ),
+        TypeExpr::App { callee, args } => Ty::app(
+            callee.0.clone(),
+            args.iter()
                 .map(|arg| type_arg_from_type_expr(source, arg))
                 .collect(),
-            text: span_text(source, ty.1).to_string(),
-        },
-        TypeExpr::Register(inner) => Ty::App {
-            name: "register".to_string(),
-            args: vec![TyArg::Type(Box::new(type_from_type_expr(source, inner)))],
-            text: span_text(source, ty.1).to_string(),
-        },
+            span_text(source, ty.1).to_string(),
+        ),
+        TypeExpr::Register(inner) => Ty::app(
+            "register",
+            vec![TyArg::Type(type_from_type_expr(source, inner))],
+            span_text(source, ty.1).to_string(),
+        ),
         TypeExpr::Effect { ty: inner, .. } => type_from_type_expr(source, inner),
         TypeExpr::Forall { body, .. } => type_from_type_expr(source, body),
         TypeExpr::Existential { body, .. } => type_from_type_expr(source, body),
-        _ => Ty::Text(span_text(source, ty.1).to_string()),
+        _ => Ty::text(span_text(source, ty.1).to_string()),
     }
 }
 
@@ -745,26 +1004,51 @@ fn type_param_spec_quantifiers_and_constraints(
     (quantifiers, constraints)
 }
 
+/// Detect Sail's `implicit('n)` parameter marker. The parser represents
+/// this as `Ty::App { name: "implicit", .. }`.
+fn ty_is_implicit(ty: &Ty) -> bool {
+    matches!(ty.kind(), TyData::App { name, .. } if name == "implicit")
+}
+
 fn scheme_from_type_expr(source: &str, ty: &Spanned<TypeExpr>) -> TypeScheme {
     let (quantifiers, constraints, current) =
         collect_forall_quantifiers_and_constraints(source, ty);
-    match type_from_type_expr(source, current) {
-        Ty::Function { params, ret } => {
-            let implicit_params = vec![false; params.len()];
+    let parsed = type_from_type_expr(source, current);
+    match parsed.kind() {
+        TyData::Function { params, ret } => {
+            // A Sail signature like `(implicit('n), bits('n)) -> bits('n)`
+            // is parsed as a single tuple param. Flatten it so that
+            // arity-checking and per-element unification work the same
+            // way the local-file path does. Also flag the implicit
+            // positions so the call-site filter can drop them when the
+            // caller doesn't pass them explicitly.
+            let ret = ret.clone();
+            let (params, implicit_params) = if params.len() == 1 {
+                if let TyData::Tuple(items) = params[0].kind() {
+                    let implicit = items.iter().map(ty_is_implicit).collect::<Vec<_>>();
+                    (items.clone(), implicit)
+                } else {
+                    let implicit = params.iter().map(ty_is_implicit).collect::<Vec<_>>();
+                    (params.clone(), implicit)
+                }
+            } else {
+                let implicit = params.iter().map(ty_is_implicit).collect::<Vec<_>>();
+                (params.clone(), implicit)
+            };
             TypeScheme {
                 quantifiers,
                 constraints,
                 params,
                 implicit_params,
-                ret: *ret,
+                ret,
             }
         }
-        ret => TypeScheme {
+        _ => TypeScheme {
             quantifiers,
             constraints,
             params: Vec::new(),
             implicit_params: Vec::new(),
-            ret,
+            ret: parsed,
         },
     }
 }
@@ -779,7 +1063,7 @@ fn mapping_from_type_expr(source: &str, ty: &Spanned<TypeExpr>) -> Option<Mappin
         } if matches!(kind, sail_parser::TypeArrowKind::Mapping) => {
             let lhs = match params.as_slice() {
                 [param] => type_from_type_expr(source, param),
-                _ => Ty::Tuple(
+                _ => Ty::tuple(
                     params
                         .iter()
                         .map(|param| type_from_type_expr(source, param))
@@ -802,15 +1086,15 @@ fn mapping_from_type_expr(source: &str, ty: &Spanned<TypeExpr>) -> Option<Mappin
 /// aliases or otherwise-unknown type names — those should NOT be flagged as
 /// "not a record" because we can't tell.
 fn is_known_non_record(ty: &Ty) -> bool {
-    match ty {
-        Ty::Unknown | Ty::Var(_) => false,
-        Ty::Function { .. } => true,
-        Ty::Tuple(_) => true,
-        Ty::Text(name) => matches!(
+    match ty.kind() {
+        TyData::Unknown | TyData::Var(_) => false,
+        TyData::Function { .. } => true,
+        TyData::Tuple(_) => true,
+        TyData::Text(name) => matches!(
             name.as_str(),
             "int" | "nat" | "bool" | "string" | "unit" | "real" | "bit"
         ),
-        Ty::App { name, .. } => matches!(
+        TyData::App { name, .. } => matches!(
             name.as_str(),
             "bits" | "vector" | "list" | "range" | "atom"
         ),
@@ -859,14 +1143,14 @@ impl TopLevelEnv {
                             env.mappings
                                 .entry(spec.name.0.clone())
                                 .or_default()
-                                .push(mapping);
+                                .push(Arc::new(mapping));
                         }
                     }
                     _ => {
                         env.functions
                             .entry(spec.name.0.clone())
                             .or_default()
-                            .push(scheme_from_type_expr(source, &spec.signature));
+                            .push(Arc::new(scheme_from_type_expr(source, &spec.signature)));
                     }
                 },
                 DefinitionKind::Callable(def) => match def.kind {
@@ -876,7 +1160,7 @@ impl TopLevelEnv {
                                 env.mappings
                                     .entry(def.name.0.clone())
                                     .or_default()
-                                    .push(mapping);
+                                    .push(Arc::new(mapping));
                             }
                         }
                     }
@@ -885,13 +1169,13 @@ impl TopLevelEnv {
                             env.functions
                                 .entry(def.name.0.clone())
                                 .or_default()
-                                .push(scheme_from_type_expr(source, signature));
+                                .push(Arc::new(scheme_from_type_expr(source, signature)));
                         } else if !env.functions.contains_key(&def.name.0) {
                             if let Some(scheme) = scheme_from_callable_head(source, def) {
                                 env.functions
                                     .entry(def.name.0.clone())
                                     .or_default()
-                                    .push(scheme);
+                                    .push(Arc::new(scheme));
                             }
                         }
                     }
@@ -965,19 +1249,34 @@ impl TopLevelEnv {
                     }
                     NamedDefKind::Union => {
                         if let Some(NamedDefDetail::Union { variants }) = &def.detail {
+                            let mut variant_names = Vec::with_capacity(variants.len());
                             for variant in variants {
                                 env.constructors
                                     .entry(variant.0.name.0.clone())
                                     .or_default()
-                                    .push(scheme_from_union_variant(source, def, &variant.0));
+                                    .push(Arc::new(scheme_from_union_variant(
+                                        source, def, &variant.0,
+                                    )));
+                                variant_names.push(variant.0.name.0.clone());
                             }
+                            env.unions
+                                .entry(def.name.0.clone())
+                                .or_default()
+                                .extend(variant_names);
                         }
                     }
                     NamedDefKind::Enum => {
+                        let enum_entry = env
+                            .enums
+                            .entry(def.name.0.clone())
+                            .or_default();
                         for member in &def.members {
                             pattern_constants.insert(member.0.clone());
                             env.values
-                                .insert(member.0.clone(), Ty::Text(def.name.0.clone()));
+                                .insert(member.0.clone(), Ty::text(def.name.0.clone()));
+                            if !enum_entry.contains(&member.0) {
+                                enum_entry.push(member.0.clone());
+                            }
                         }
                     }
                     NamedDefKind::Register => {
@@ -996,7 +1295,7 @@ impl TopLevelEnv {
                             .ty
                             .as_ref()
                             .map(|t| type_from_type_expr(source, t))
-                            .unwrap_or(Ty::Unknown);
+                            .unwrap_or(Ty::unknown());
                         env.values.insert(def.name.0.clone(), ty);
                     }
                     _ => {}
@@ -1006,7 +1305,11 @@ impl TopLevelEnv {
                 {
                     pattern_constants.insert(def.member.0.clone());
                     env.values
-                        .insert(def.member.0.clone(), Ty::Text(def.name.0.clone()));
+                        .insert(def.member.0.clone(), Ty::text(def.name.0.clone()));
+                    let entry = env.enums.entry(def.name.0.clone()).or_default();
+                    if !entry.contains(&def.member.0) {
+                        entry.push(def.member.0.clone());
+                    }
                 }
                 DefinitionKind::Default(def)
                     if def.kind.0 == "Order" && def.direction.0.eq_ignore_ascii_case("inc") =>
@@ -1043,9 +1346,9 @@ impl TopLevelEnv {
         let mut current = ty.clone();
         let mut seen: HashSet<String> = HashSet::new();
         loop {
-            let name_to_resolve = match &current {
-                Ty::Text(name) => name.clone(),
-                Ty::App { name, .. } => name.clone(),
+            let name_to_resolve = match current.kind() {
+                TyData::Text(name) => name.clone(),
+                TyData::App { name, .. } => name.clone(),
                 _ => return current,
             };
             if !seen.insert(name_to_resolve.clone()) {
@@ -1090,10 +1393,10 @@ impl TopLevelEnv {
             .or_else(|| {
                 let schemes = self.functions.get(name)?;
                 if schemes.len() == 1 {
-                    Some(Ty::Function {
-                        params: schemes[0].params.clone(),
-                        ret: Box::new(schemes[0].ret.clone()),
-                    })
+                    Some(Ty::function(
+                        schemes[0].params.clone(),
+                        schemes[0].ret.clone(),
+                    ))
                 } else {
                     None
                 }
@@ -1101,38 +1404,53 @@ impl TopLevelEnv {
             .or_else(|| {
                 let schemes = self.constructors.get(name)?;
                 if schemes.len() == 1 {
-                    Some(Ty::Function {
-                        params: schemes[0].params.clone(),
-                        ret: Box::new(schemes[0].ret.clone()),
-                    })
+                    Some(Ty::function(
+                        schemes[0].params.clone(),
+                        schemes[0].ret.clone(),
+                    ))
                 } else {
                     None
                 }
             })
     }
 
-    fn lookup_functions(&self, name: &str) -> Vec<TypeScheme> {
+    /// Resolve every callable scheme matching `name` from this env. Each
+    /// returned `Arc<TypeScheme>` is a refcount bump — no scheme data is
+    /// copied. The SmallVec stays on the stack in the common single- or
+    /// few-overload case, so the result is also allocation-free.
+    fn lookup_functions(&self, name: &str) -> SmallVec<[Arc<TypeScheme>; 4]> {
+        let mut out: SmallVec<[Arc<TypeScheme>; 4]> = SmallVec::new();
         if let Some(members) = self.overloads.get(name) {
-            let mut out = Vec::new();
             for member in members {
                 if let Some(schemes) = self.functions.get(member) {
                     out.extend(schemes.iter().cloned());
                 }
             }
-            out
-        } else {
-            let mut out = self.functions.get(name).cloned().unwrap_or_default();
-            out.extend(self.constructors.get(name).cloned().unwrap_or_default());
-            out
+            return out;
         }
+        if let Some(schemes) = self.functions.get(name) {
+            out.extend(schemes.iter().cloned());
+        }
+        if let Some(schemes) = self.constructors.get(name) {
+            out.extend(schemes.iter().cloned());
+        }
+        out
     }
 
-    fn lookup_constructors(&self, name: &str) -> Vec<TypeScheme> {
-        self.constructors.get(name).cloned().unwrap_or_default()
+    fn lookup_constructors(&self, name: &str) -> SmallVec<[Arc<TypeScheme>; 4]> {
+        let mut out: SmallVec<[Arc<TypeScheme>; 4]> = SmallVec::new();
+        if let Some(schemes) = self.constructors.get(name) {
+            out.extend(schemes.iter().cloned());
+        }
+        out
     }
 
-    fn lookup_mappings(&self, name: &str) -> Vec<MappingScheme> {
-        self.mappings.get(name).cloned().unwrap_or_default()
+    fn lookup_mappings(&self, name: &str) -> SmallVec<[Arc<MappingScheme>; 4]> {
+        let mut out: SmallVec<[Arc<MappingScheme>; 4]> = SmallVec::new();
+        if let Some(schemes) = self.mappings.get(name) {
+            out.extend(schemes.iter().cloned());
+        }
+        out
     }
 }
 
@@ -1155,36 +1473,33 @@ fn scheme_from_union_variant(
                     if param.is_constant {
                         TyArg::Value(param.name.0.clone())
                     } else {
-                        TyArg::Type(Box::new(Ty::Var(param.name.0.clone())))
+                        TyArg::Type(Ty::var(param.name.0.clone()))
                     }
                 })
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
     let ret = if params.is_empty() {
-        Ty::Text(def.name.0.clone())
+        Ty::text(def.name.0.clone())
     } else {
-        Ty::App {
-            name: def.name.0.clone(),
-            text: format!(
-                "{}({})",
-                def.name.0,
-                params
-                    .iter()
-                    .map(|arg| match arg {
-                        TyArg::Type(ty) => ty.text(),
-                        TyArg::Value(value) => value.clone(),
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-            args: params,
-        }
+        let text = format!(
+            "{}({})",
+            def.name.0,
+            params
+                .iter()
+                .map(|arg| match arg {
+                    TyArg::Type(ty) => ty.display_text(),
+                    TyArg::Value(value) => value.clone(),
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        Ty::app(def.name.0.clone(), params, text)
     };
 
     let payload_ty = match &variant.payload {
         sail_parser::core_ast::UnionPayload::Type(ty) => Some(type_from_type_expr(source, ty)),
-        sail_parser::core_ast::UnionPayload::Struct { .. } => Some(Ty::Unknown),
+        sail_parser::core_ast::UnionPayload::Struct { .. } => Some(Ty::unknown()),
     };
     // In Sail, ALL union constructors take an argument (even unit-payload
     // ones are invoked as `Name()` with the unit value). Don't drop the
@@ -1250,12 +1565,12 @@ fn scheme_from_callable_head(
         .map(|param| {
             pattern_annotation_type(source, param)
                 .or_else(|| infer_pattern_head_type(source, param))
-                .unwrap_or(Ty::Unknown)
+                .unwrap_or(Ty::unknown())
         })
         .collect::<Vec<_>>();
     let ret = return_ty
         .map(|ty| type_from_type_expr(source, ty))
-        .unwrap_or(Ty::Unknown);
+        .unwrap_or(Ty::unknown());
     let param_count = params.len();
 
     Some(TypeScheme {
@@ -1278,9 +1593,9 @@ fn bitfield_field_ty(source: &str, field: &BitfieldField) -> Ty {
         })
         .or_else(|| bitfield_range_width_from_text(&span_text(source, field.high.1)))
     {
-        Some(1) if field.low.is_none() => Ty::Text("bit".to_string()),
+        Some(1) if field.low.is_none() => Ty::text("bit".to_string()),
         Some(width) => bits_ty(width),
-        None => Ty::Unknown,
+        None => Ty::unknown(),
     }
 }
 
@@ -1308,7 +1623,7 @@ fn synthesize_bitfield_accessors(
     field_name: &str,
     field_ty: Ty,
 ) {
-    let bitfield_ty = Ty::Text(bitfield_name.to_string());
+    let bitfield_ty = Ty::text(bitfield_name.to_string());
     let getter_name = format!("_get_{bitfield_name}_{field_name}");
     let setter_name = format!("_set_{bitfield_name}_{field_name}");
     let updater_name = format!("_update_{bitfield_name}_{field_name}");
@@ -1317,21 +1632,24 @@ fn synthesize_bitfield_accessors(
     env.functions
         .entry(getter_name.clone())
         .or_default()
-        .push(plain_scheme(vec![bitfield_ty.clone()], field_ty.clone()));
+        .push(Arc::new(plain_scheme(
+            vec![bitfield_ty.clone()],
+            field_ty.clone(),
+        )));
     env.functions
         .entry(setter_name.clone())
         .or_default()
-        .push(plain_scheme(
+        .push(Arc::new(plain_scheme(
             vec![register_ty(bitfield_ty.clone()), field_ty.clone()],
-            Ty::Text("unit".to_string()),
-        ));
+            Ty::text("unit".to_string()),
+        )));
     env.functions
         .entry(updater_name)
         .or_default()
-        .push(plain_scheme(
+        .push(Arc::new(plain_scheme(
             vec![bitfield_ty.clone(), field_ty.clone()],
             bitfield_ty,
-        ));
+        )));
     env.overloads
         .entry(overload_name)
         .or_default()
@@ -1355,8 +1673,8 @@ fn apply_callable_signature_metadata(file: &File, env: &mut TopLevelEnv) {
                 param
                     .name
                     .split_once(':')
-                    .map(|(_, ty)| Ty::Text(ty.trim().to_string()))
-                    .unwrap_or(Ty::Unknown)
+                    .map(|(_, ty)| Ty::text(ty.trim().to_string()))
+                    .unwrap_or(Ty::unknown())
             })
             .collect::<Vec<_>>();
         let score = signature
@@ -1392,35 +1710,46 @@ fn apply_callable_signature_metadata(file: &File, env: &mut TopLevelEnv) {
         let Some(schemes) = env.functions.get_mut(&name) else {
             continue;
         };
-        let mut matched = false;
-        if let Some(scheme) = schemes.iter_mut().find(|scheme| {
-            scheme.params.len() == implicit_params.len()
-                || matches!(
-                    scheme.params.as_slice(),
-                    [Ty::Tuple(items)] if items.len() == implicit_params.len()
-                )
-        }) {
-            if let [Ty::Tuple(items)] = scheme.params.as_slice() {
-                if items.len() == implicit_params.len() {
-                    scheme.params = items.clone();
+        // Find a matching scheme by index. We can't keep an `&mut Arc<...>`
+        // borrow across `Arc::make_mut` (which needs exclusive access to
+        // the slot), so we resolve the index first and mutate after.
+        let matched_idx = schemes.iter().position(|scheme| {
+            if scheme.params.len() == implicit_params.len() {
+                return true;
+            }
+            if scheme.params.len() == 1 {
+                if let TyData::Tuple(items) = scheme.params[0].kind() {
+                    return items.len() == implicit_params.len();
+                }
+            }
+            false
+        });
+        if let Some(idx) = matched_idx {
+            let scheme = Arc::make_mut(&mut schemes[idx]);
+            if scheme.params.len() == 1 {
+                if let TyData::Tuple(items) = scheme.params[0].kind() {
+                    if items.len() == implicit_params.len() {
+                        let new_params = items.clone();
+                        scheme.params = new_params;
+                    }
                 }
             }
             scheme.implicit_params = implicit_params.clone();
             if scheme.ret.is_unknown() {
                 if let Some(ret) = return_type.as_deref() {
-                    scheme.ret = Ty::Text(ret.to_string());
+                    scheme.ret = Ty::text(ret.to_string());
                 }
             }
-            matched = true;
+            continue;
         }
 
-        if !matched && schemes.len() == 1 {
-            let scheme = &mut schemes[0];
+        if schemes.len() == 1 {
+            let scheme = Arc::make_mut(&mut schemes[0]);
             scheme.params = signature_params;
             scheme.implicit_params = implicit_params;
             if scheme.ret.is_unknown() {
                 if let Some(ret) = return_type.as_deref() {
-                    scheme.ret = Ty::Text(ret.to_string());
+                    scheme.ret = Ty::text(ret.to_string());
                 }
             }
         }
@@ -1446,7 +1775,7 @@ fn infer_pattern_head_type(source: &str, pattern: &Spanned<Pattern>) -> Option<T
             .iter()
             .map(|item| infer_pattern_head_type(source, item))
             .collect::<Option<Vec<_>>>()
-            .map(Ty::Tuple),
+            .map(Ty::tuple),
         Pattern::Vector(items) => {
             let elem_tys = items
                 .iter()
@@ -1466,11 +1795,8 @@ fn infer_pattern_head_type(source: &str, pattern: &Spanned<Pattern>) -> Option<T
                 .collect::<Option<Vec<_>>>()?;
             let first = elem_tys.first()?.clone();
             if elem_tys.iter().all(|item| *item == first) {
-                Some(Ty::App {
-                    name: "list".to_string(),
-                    args: vec![TyArg::Type(Box::new(first.clone()))],
-                    text: format!("list({})", first.text()),
-                })
+                let text = format!("list({})", first.display_text());
+                Some(Ty::app("list", vec![TyArg::Type(first.clone())], text))
             } else {
                 None
             }
@@ -1481,85 +1807,72 @@ fn infer_pattern_head_type(source: &str, pattern: &Spanned<Pattern>) -> Option<T
 
 fn infer_literal_type(literal: &Literal) -> Ty {
     match literal {
-        Literal::Bool(_) => Ty::Text("bool".to_string()),
-        Literal::Unit => Ty::Text("unit".to_string()),
+        Literal::Bool(_) => Ty::text("bool".to_string()),
+        Literal::Unit => Ty::text("unit".to_string()),
         Literal::Number(text) => {
             if text.contains('.') {
-                Ty::Text("real".to_string())
+                Ty::text("real".to_string())
             } else {
-                Ty::Text("int".to_string())
+                Ty::text("int".to_string())
             }
         }
-        Literal::Binary(text) => Ty::App {
-            name: "bits".to_string(),
-            args: vec![TyArg::Value(
-                text.trim_start_matches("0b")
-                    .chars()
-                    .filter(|ch| *ch != '_')
-                    .count()
-                    .to_string(),
-            )],
-            text: format!(
-                "bits({})",
-                text.trim_start_matches("0b")
-                    .chars()
-                    .filter(|ch| *ch != '_')
-                    .count()
-            ),
-        },
-        Literal::Hex(text) => Ty::App {
-            name: "bits".to_string(),
-            args: vec![TyArg::Value(
-                (text
-                    .trim_start_matches("0x")
-                    .chars()
-                    .filter(|ch| *ch != '_')
-                    .count()
-                    * 4)
-                .to_string(),
-            )],
-            text: format!(
-                "bits({})",
-                text.trim_start_matches("0x")
-                    .chars()
-                    .filter(|ch| *ch != '_')
-                    .count()
-                    * 4
-            ),
-        },
-        Literal::String(_) => Ty::Text("string".to_string()),
-        Literal::BitZero | Literal::BitOne => Ty::Text("bit".to_string()),
-        Literal::Undefined => Ty::Unknown,
+        Literal::Binary(text) => {
+            let bits = text
+                .trim_start_matches("0b")
+                .chars()
+                .filter(|ch| *ch != '_')
+                .count();
+            Ty::app(
+                "bits",
+                vec![TyArg::Value(bits.to_string())],
+                format!("bits({bits})"),
+            )
+        }
+        Literal::Hex(text) => {
+            let bits = text
+                .trim_start_matches("0x")
+                .chars()
+                .filter(|ch| *ch != '_')
+                .count()
+                * 4;
+            Ty::app(
+                "bits",
+                vec![TyArg::Value(bits.to_string())],
+                format!("bits({bits})"),
+            )
+        }
+        Literal::String(_) => Ty::text("string".to_string()),
+        Literal::BitZero | Literal::BitOne => Ty::text("bit".to_string()),
+        Literal::Undefined => Ty::unknown(),
     }
 }
 
 fn bits_ty(width: impl ToString) -> Ty {
     let width = width.to_string();
-    Ty::App {
-        name: "bits".to_string(),
-        args: vec![TyArg::Value(width.clone())],
-        text: format!("bits({width})"),
-    }
+    Ty::app(
+        "bits",
+        vec![TyArg::Value(width.clone())],
+        format!("bits({width})"),
+    )
 }
 
 fn register_ty(inner: Ty) -> Ty {
-    Ty::App {
-        name: "register".to_string(),
-        args: vec![TyArg::Type(Box::new(inner.clone()))],
-        text: format!("register({})", inner.text()),
-    }
+    let inner_text = inner.display_text();
+    Ty::app(
+        "register",
+        vec![TyArg::Type(inner)],
+        format!("register({inner_text})"),
+    )
 }
 
 fn vector_ty(width: impl ToString, elem: Ty) -> Ty {
     let width = width.to_string();
-    Ty::App {
-        name: "vector".to_string(),
-        args: vec![
-            TyArg::Value(width.clone()),
-            TyArg::Type(Box::new(elem.clone())),
-        ],
-        text: format!("vector({width}, {})", elem.text()),
-    }
+    let elem_text = elem.display_text();
+    Ty::app(
+        "vector",
+        vec![TyArg::Value(width.clone()), TyArg::Type(elem)],
+        format!("vector({width}, {elem_text})"),
+    )
 }
 
 fn plain_scheme(params: Vec<Ty>, ret: Ty) -> TypeScheme {
@@ -1913,7 +2226,7 @@ fn eval_numeric_expr_with_assumptions(
             .and_then(|value| parse_numeric_expr_text(value))
             .or_else(|| {
                 subst.types.get(name).and_then(|ty| {
-                    let text = ty.text();
+                    let text = ty.display_text();
                     parse_numeric_expr_text(&text)
                 })
             });
@@ -1986,7 +2299,7 @@ fn linear_numeric_expr(
             .and_then(|value| parse_numeric_expr_text(value))
             .or_else(|| {
                 subst.types.get(name).and_then(|ty| {
-                    let text = ty.text();
+                    let text = ty.display_text();
                     parse_numeric_expr_text(&text)
                 })
             })
@@ -2128,14 +2441,17 @@ fn pattern_static_bit_width(source: &str, pattern: &Spanned<Pattern>) -> Option<
         Pattern::Attribute { pattern, .. } => pattern_static_bit_width(source, pattern),
         Pattern::Typed(inner, ty) | Pattern::AsType(inner, ty) => {
             pattern_static_bit_width(source, inner).or_else(|| {
-                match type_from_type_expr(source, ty) {
-                    Ty::App { name, args, .. } if name == "bits" => args.first().and_then(|arg| {
-                        if let TyArg::Value(value) = arg {
-                            parse_int_literal(value)
-                        } else {
-                            None
-                        }
-                    }),
+                let parsed = type_from_type_expr(source, ty);
+                match parsed.kind() {
+                    TyData::App { name, args, .. } if name == "bits" => {
+                        args.first().and_then(|arg| {
+                            if let TyArg::Value(value) = arg {
+                                parse_int_literal(value)
+                            } else {
+                                None
+                            }
+                        })
+                    }
                     _ => None,
                 }
             })
@@ -2206,7 +2522,7 @@ fn app_text(name: &str, args: &[TyArg]) -> String {
             name,
             args.iter()
                 .map(|arg| match arg {
-                    TyArg::Type(ty) => ty.text(),
+                    TyArg::Type(ty) => ty.display_text(),
                     TyArg::Value(value) => value.clone(),
                 })
                 .collect::<Vec<_>>()
@@ -2220,14 +2536,15 @@ fn normalized_value_text(text: &str) -> String {
 }
 
 fn ty_contains_var(ty: &Ty, name: &str) -> bool {
-    match ty {
-        Ty::Unknown | Ty::Text(_) => false,
-        Ty::Var(var) => var == name,
-        Ty::Tuple(items) => items.iter().any(|item| ty_contains_var(item, name)),
-        Ty::Function { params, ret } => {
-            params.iter().any(|param| ty_contains_var(param, name)) || ty_contains_var(ret, name)
+    match ty.kind() {
+        TyData::Unknown | TyData::Text(_) => false,
+        TyData::Var(var) => var == name,
+        TyData::Tuple(items) => items.iter().any(|item| ty_contains_var(item, name)),
+        TyData::Function { params, ret } => {
+            params.iter().any(|param| ty_contains_var(param, name))
+                || ty_contains_var(ret, name)
         }
-        Ty::App { args, .. } => args.iter().any(|arg| match arg {
+        TyData::App { args, .. } => args.iter().any(|arg| match arg {
             TyArg::Type(ty) => ty_contains_var(ty, name),
             TyArg::Value(_) => false,
         }),
@@ -2417,7 +2734,7 @@ fn subst_numeric_expr(expr: &NumericExpr, subst: &Subst) -> NumericExpr {
                 .and_then(|value| parse_numeric_expr_text(value))
                 .or_else(|| {
                     subst.types.get(name).and_then(|ty| {
-                        let text = ty.text();
+                        let text = ty.display_text();
                         parse_numeric_expr_text(&text)
                     })
                 });
@@ -2921,27 +3238,29 @@ fn unify_value(expected: &str, actual: &str, subst: &mut Subst) -> bool {
 }
 
 fn apply_subst(ty: &Ty, subst: &Subst) -> Ty {
-    match ty {
-        Ty::Unknown => Ty::Unknown,
-        Ty::Text(text) => Ty::Text(text.clone()),
-        Ty::Var(name) => subst
+    match ty.kind() {
+        TyData::Unknown => ty.clone(),
+        TyData::Text(_) => ty.clone(),
+        TyData::Var(name) => subst
             .types
             .get(name)
             .cloned()
-            .unwrap_or_else(|| Ty::Var(name.clone())),
-        Ty::Tuple(items) => Ty::Tuple(items.iter().map(|item| apply_subst(item, subst)).collect()),
-        Ty::Function { params, ret } => Ty::Function {
-            params: params
+            .unwrap_or_else(|| ty.clone()),
+        TyData::Tuple(items) => {
+            Ty::tuple(items.iter().map(|item| apply_subst(item, subst)).collect())
+        }
+        TyData::Function { params, ret } => Ty::function(
+            params
                 .iter()
                 .map(|param| apply_subst(param, subst))
                 .collect(),
-            ret: Box::new(apply_subst(ret, subst)),
-        },
-        Ty::App { name, args, .. } => {
+            apply_subst(ret, subst),
+        ),
+        TyData::App { name, args, .. } => {
             let args = args
                 .iter()
                 .map(|arg| match arg {
-                    TyArg::Type(ty) => TyArg::Type(Box::new(apply_subst(ty, subst))),
+                    TyArg::Type(t) => TyArg::Type(apply_subst(t, subst)),
                     TyArg::Value(value) => TyArg::Value(
                         subst
                             .values
@@ -2951,173 +3270,261 @@ fn apply_subst(ty: &Ty, subst: &Subst) -> Ty {
                     ),
                 })
                 .collect::<Vec<_>>();
-            Ty::App {
-                name: name.clone(),
-                text: app_text(name, &args),
-                args,
-            }
+            let text = app_text(name, &args);
+            Ty::app(name.clone(), args, text)
         }
     }
 }
 
+/// Whether a textual type name is one of Sail's numeric scalar types,
+/// including parameterised forms like `range(0, 10)` or `atom('n)`.
+fn is_numeric_text(t: &str) -> bool {
+    t == "int"
+        || t == "nat"
+        || t.starts_with("range(")
+        || t.starts_with("atom(")
+        || t.starts_with("int(")
+        || t.starts_with("nat(")
+}
+
+/// Cheap structural test: is `ty` a Sail numeric scalar type
+/// (`int`, `nat`, or `range(_)` / `atom(_)` / `int(_)` / `nat(_)`)?
+/// Allocation-free; replaces a series of `.display_text().starts_with("range(")`
+/// fallbacks that used to dominate `unify`'s hot path.
+fn is_numeric_scalar_ty(ty: &Ty) -> bool {
+    match ty.kind() {
+        TyData::Text(t) => t == "int" || t == "nat",
+        TyData::App { name, .. } => {
+            matches!(name.as_str(), "range" | "atom" | "int" | "nat")
+        }
+        _ => false,
+    }
+}
+
+/// Whether `ty` is something the checker classes as a "primitive scalar"
+/// for the purposes of accepting cross-file aliases. Mirrors the previous
+/// `is_actual_primitive` check in `unify`, but without going through
+/// `Ty::display_text()`.
+fn is_primitive_or_bits_ty(ty: &Ty) -> bool {
+    match ty.kind() {
+        TyData::Text(t) => matches!(
+            t.as_str(),
+            "int" | "nat" | "bool" | "string" | "unit" | "real" | "bit" | "_"
+        ),
+        TyData::App { name, .. } => {
+            matches!(name.as_str(), "bits" | "range" | "atom" | "int" | "nat")
+        }
+        _ => false,
+    }
+}
+
+/// Extract the bitvector width if `ty` looks like `bits(N)` or `bit`
+/// (which is `bits(1)`). Returns the width string from `Ty::App`'s value
+/// arg without going through `Ty::display_text()`.
+fn bits_width<'a>(ty: &'a Ty) -> Option<&'a str> {
+    match ty.kind() {
+        TyData::Text(t) if t == "bit" => Some("1"),
+        TyData::App { name, args, .. } if name == "bits" => match args.first() {
+            Some(TyArg::Value(width)) => Some(width.as_str()),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Maximum recursion depth for `unify`. Sail signatures rarely nest
+/// types more than ~10 levels (`forall ... vector(N, struct{...})`), so
+/// 96 leaves a healthy safety margin while still tripping a runaway
+/// before the worker thread's 64 MiB stack overflows.
+const UNIFY_DEPTH_LIMIT: usize = 96;
+
 fn unify(expected: &Ty, actual: &Ty, subst: &mut Subst) -> bool {
-    // Symmetric early-out for Unknown: either side being Unknown means we
-    // can't verify types (typically a cross-file reference), so we accept.
-    if matches!(actual, Ty::Unknown) {
+    unify_inner(expected, actual, subst, 0)
+}
+
+fn unify_inner(expected: &Ty, actual: &Ty, subst: &mut Subst, depth: usize) -> bool {
+    if depth > UNIFY_DEPTH_LIMIT {
+        // Refuse to recurse further. Conservatively accept — the
+        // alternative is reporting a spurious mismatch on a deeply
+        // nested type we couldn't fully walk.
         return true;
     }
-    match expected {
-        Ty::Unknown => true,
-        Ty::Var(name) => {
-            if matches!(actual, Ty::Var(actual_name) if actual_name == name) {
+    // Symmetric early-out for Unknown: either side being Unknown means we
+    // can't verify types (typically a cross-file reference), so we accept.
+    if actual.is_unknown() {
+        return true;
+    }
+    match expected.kind() {
+        TyData::Unknown => true,
+        TyData::Var(name) => {
+            if matches!(actual.kind(), TyData::Var(actual_name) if actual_name == name) {
                 return true;
             }
             if ty_contains_var(actual, name) {
                 return false;
             }
             match subst.types.get(name).cloned() {
-                Some(bound) => unify(&bound, actual, subst),
+                Some(bound) => unify_inner(&bound, actual, subst, depth + 1),
                 None => {
                     subst.types.insert(name.clone(), actual.clone());
                     true
                 }
             }
         }
-        Ty::Text(expected) => {
-            let actual_text = actual.text();
-            if expected == &actual_text {
-                return true;
+        TyData::Text(expected) => {
+            // Tuples and Functions can never match a text type. Bail out
+            // before paying for `actual.display_text()`.
+            if matches!(actual.kind(), TyData::Tuple(_) | TyData::Function { .. }) {
+                return false;
             }
-            // Sail equivalence: bit ≡ bits(1).
-            if (expected == "bit" && actual_text == "bits(1)")
-                || (expected == "bits(1)" && actual_text == "bit")
-            {
-                return true;
+            // Direct text match.
+            if let TyData::Text(actual_text) = actual.kind() {
+                if expected == actual_text {
+                    return true;
+                }
+                // bit ≡ bits(1) — check via the textual form on the left
+                // (the App-side analogue is handled lower down).
+                if (expected == "bit" && actual_text == "bits(1)")
+                    || (expected == "bits(1)" && actual_text == "bit")
+                {
+                    return true;
+                }
+                // Two different primitives are not equivalent unless they
+                // are both numeric scalars (which fall into the structural
+                // numeric check below).
+                let primitives = [
+                    "int", "nat", "bool", "string", "unit", "real", "bit", "_",
+                ];
+                let exp_prim = primitives.contains(&expected.as_str());
+                let act_prim = primitives.contains(&actual_text.as_str());
+                if exp_prim
+                    && act_prim
+                    && !(is_numeric_text(expected) && is_numeric_text(actual_text))
+                {
+                    return false;
+                }
             }
             // Sail subtyping: int ↔ range(...) ↔ atom(...) ↔ nat ↔ int(N)
             // are all numeric and the LSP can't verify exact constraints.
-            // Treat them as compatible to avoid false positives.
-            let is_numeric = |t: &str| {
-                t == "int"
-                    || t == "nat"
-                    || t.starts_with("range(")
-                    || t.starts_with("atom(")
-                    || t.starts_with("int(")
-                    || t.starts_with("nat(")
-            };
-            if is_numeric(expected.as_str()) && is_numeric(&actual_text) {
+            if is_numeric_text(expected) && is_numeric_scalar_ty(actual) {
                 return true;
             }
-            // Cross-file type aliases (e.g. xlenbits = bits(64), regidx = bits(5))
-            // are unknown to the local type checker. If either side is a non-
+            // bit ≡ bits(1) (App form on the right).
+            if expected == "bit" {
+                if let Some(width) = bits_width(actual) {
+                    return width.trim() == "1";
+                }
+            }
+            // bits(N) form on the LHS string vs structured `Ty::App` on RHS.
+            if expected.starts_with("bits(") && expected.ends_with(')') {
+                let expected_width = &expected["bits(".len()..expected.len() - 1];
+                if let Some(actual_width) = bits_width(actual) {
+                    let exp_num = expected_width.parse::<i64>().ok();
+                    let act_num = actual_width.parse::<i64>().ok();
+                    return match (exp_num, act_num) {
+                        (Some(a), Some(b)) => a == b,
+                        // Either side has a type variable / arithmetic — we
+                        // can't decide without SMT, so be permissive.
+                        _ => true,
+                    };
+                }
+            }
+            // Cross-file type aliases (e.g. xlenbits = bits(64)) are
+            // unknown to the local type checker. If either side is a non-
             // primitive type name we can't resolve, treat them as compatible.
             let primitives = [
                 "int", "nat", "bool", "string", "unit", "real", "bit", "_",
             ];
             let is_expected_primitive = primitives.contains(&expected.as_str());
-            let is_actual_primitive = primitives.contains(&actual_text.as_str())
-                || actual_text.starts_with("bits(")
-                || actual_text.starts_with("range(")
-                || actual_text.starts_with("atom(");
+            let is_actual_primitive = is_primitive_or_bits_ty(actual);
             if !is_expected_primitive || !is_actual_primitive {
-                // At least one side is a custom/aliased type — we can't be sure.
                 return true;
             }
-            // Two different bitvector sizes — only error if BOTH widths are
-            // pure numeric literals. If either side mentions type variables
-            // (like 'n, 'm) or arithmetic, we can't compute equivalence
-            // without an SMT solver, so be permissive.
-            if expected.starts_with("bits(") && actual_text.starts_with("bits(") {
-                let expected_width = &expected["bits(".len()..expected.len() - 1];
-                let actual_width = &actual_text["bits(".len()..actual_text.len() - 1];
-                let expected_is_num = expected_width.parse::<i64>().is_ok();
-                let actual_is_num = actual_width.parse::<i64>().is_ok();
-                if !expected_is_num || !actual_is_num {
-                    return true;
-                }
-                return false;
-            }
-            // Two different primitives — also not equivalent (e.g. int vs bool).
             false
         }
-        Ty::Tuple(expected_items) => match actual {
-            Ty::Tuple(actual_items) if expected_items.len() == actual_items.len() => expected_items
-                .iter()
-                .zip(actual_items.iter())
-                .all(|(expected, actual)| unify(expected, actual, subst)),
+        TyData::Tuple(expected_items) => match actual.kind() {
+            TyData::Tuple(actual_items) if expected_items.len() == actual_items.len() => {
+                expected_items
+                    .iter()
+                    .zip(actual_items.iter())
+                    .all(|(e, a)| unify_inner(e, a, subst, depth + 1))
+            }
             _ => false,
         },
-        Ty::Function {
+        TyData::Function {
             params: expected_params,
             ret: expected_ret,
-        } => match actual {
-            Ty::Function {
+        } => match actual.kind() {
+            TyData::Function {
                 params: actual_params,
                 ret: actual_ret,
             } if expected_params.len() == actual_params.len() => {
                 expected_params
                     .iter()
                     .zip(actual_params.iter())
-                    .all(|(expected, actual)| unify(expected, actual, subst))
-                    && unify(expected_ret, actual_ret, subst)
+                    .all(|(e, a)| unify_inner(e, a, subst, depth + 1))
+                    && unify_inner(expected_ret, actual_ret, subst, depth + 1)
             }
             _ => false,
         },
-        Ty::App {
+        TyData::App {
             name: expected_name,
             args: expected_args,
             ..
         } => {
             // Sail subtyping: range/atom/nat/int and parameterized int(N) /
-            // atom(N) / nat(N) are all numeric. Treat them as compatible
-            // without verifying constraints (no SMT in LSP).
-            let actual_text = actual.text();
-            let numeric_app = |name: &str| {
-                name == "range" || name == "atom" || name == "int" || name == "nat"
-            };
-            if numeric_app(expected_name)
-                && (actual_text == "int"
-                    || actual_text == "nat"
-                    || actual_text.starts_with("range(")
-                    || actual_text.starts_with("atom(")
-                    || actual_text.starts_with("int(")
-                    || actual_text.starts_with("nat("))
+            // atom(N) / nat(N) are all numeric. Structural check, no
+            // string allocation.
+            if matches!(expected_name.as_str(), "range" | "atom" | "int" | "nat")
+                && is_numeric_scalar_ty(actual)
             {
                 return true;
             }
             // bit ≡ bits(1) — accept either direction.
-            if expected_name == "bits" && actual_text == "bit" {
+            if expected_name == "bits"
+                && matches!(actual.kind(), TyData::Text(t) if t == "bit")
+            {
                 if let Some(TyArg::Value(width)) = expected_args.first() {
-                    if width == "1" || width.trim() == "1" {
+                    if width.trim() == "1" {
                         return true;
                     }
                 }
             }
-            // bits(N) ≡ vector(N, bit) (Sail equivalence).
-            if expected_name == "bits" && actual_text.starts_with("vector(") {
-                // Parse vector(N, bit) and check if elem is bit.
-                // Format is "vector(N, bit)" — strip the prefix and ", bit)" suffix.
-                let inner = &actual_text["vector(".len()..actual_text.len() - 1];
-                if inner.ends_with(", bit") {
-                    let actual_n = &inner[..inner.len() - ", bit".len()];
-                    if let Some(TyArg::Value(expected_n)) = expected_args.first() {
-                        return unify_value(expected_n, actual_n, subst);
-                    }
-                }
-            }
-            if expected_name == "vector" && actual_text.starts_with("bits(") {
-                let actual_n = &actual_text["bits(".len()..actual_text.len() - 1];
-                if let Some(TyArg::Value(expected_n)) = expected_args.first() {
-                    // Check second arg is bit
-                    if let Some(TyArg::Type(elem)) = expected_args.get(1) {
-                        if elem.text() == "bit" {
-                            return unify_value(expected_n, actual_n, subst);
+            // bits(N) ≡ vector(N, bit) (Sail equivalence). Structural,
+            // both directions handled.
+            if expected_name == "bits" {
+                if let TyData::App {
+                    name: a_name,
+                    args: a_args,
+                    ..
+                } = actual.kind()
+                {
+                    if a_name == "vector" {
+                        if let (Some(TyArg::Value(actual_n)), Some(TyArg::Type(elem))) =
+                            (a_args.first(), a_args.get(1))
+                        {
+                            if matches!(elem.kind(), TyData::Text(t) if t == "bit") {
+                                if let Some(TyArg::Value(expected_n)) = expected_args.first() {
+                                    return unify_value(expected_n, actual_n, subst);
+                                }
+                            }
                         }
                     }
                 }
             }
-            match actual {
-                Ty::App {
+            if expected_name == "vector" {
+                if let Some(actual_n) = bits_width(actual) {
+                    if let Some(TyArg::Value(expected_n)) = expected_args.first() {
+                        if let Some(TyArg::Type(elem)) = expected_args.get(1) {
+                            if matches!(elem.kind(), TyData::Text(t) if t == "bit") {
+                                return unify_value(expected_n, actual_n, subst);
+                            }
+                        }
+                    }
+                }
+            }
+            match actual.kind() {
+                TyData::App {
                     name: actual_name,
                     args: actual_args,
                     ..
@@ -3129,22 +3536,90 @@ fn unify(expected: &Ty, actual: &Ty, subst: &mut Subst) -> bool {
                         .zip(actual_args.iter())
                         .all(|(expected, actual)| match (expected, actual) {
                             (TyArg::Type(expected), TyArg::Type(actual)) => {
-                                unify(expected, actual, subst)
+                                unify_inner(expected, actual, subst, depth + 1)
                             }
                             (TyArg::Value(expected), TyArg::Value(actual)) => {
                                 unify_value(expected, actual, subst)
                             }
                             (TyArg::Value(expected), TyArg::Type(actual)) => {
-                                unify_value(expected, &actual.text(), subst)
+                                unify_value(expected, &actual.display_text(), subst)
                             }
                             (TyArg::Type(expected), TyArg::Value(actual)) => {
-                                unify(expected, &Ty::Text(actual.clone()), subst)
+                                unify_inner(
+                                    expected,
+                                    &Ty::text(actual.clone()),
+                                    subst,
+                                    depth + 1,
+                                )
                             }
                         })
                 }
                 _ => false,
             }
         }
+    }
+}
+
+/// Pretty-print a `TypeScheme` as a Sail-style signature, e.g.
+/// `forall 'n, 'm, 'n > 0. (bits('n), int('m)) -> bits('n + 'm)`.
+/// Used to enrich `UnresolvedQuants` diagnostics so users see which
+/// callable shape their unresolved type variables came from.
+fn format_scheme_signature(scheme: &TypeScheme) -> String {
+    let mut header = String::new();
+    if !scheme.quantifiers.is_empty() || !scheme.constraints.is_empty() {
+        header.push_str("forall ");
+        let parts = scheme
+            .quantifiers
+            .iter()
+            .cloned()
+            .chain(scheme.constraints.iter().map(|c| c.text.clone()))
+            .collect::<Vec<_>>();
+        header.push_str(&parts.join(", "));
+        header.push_str(". ");
+    }
+    let params = scheme
+        .params
+        .iter()
+        .map(|p| p.display_text())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let ret = scheme.ret.display_text();
+    if scheme.params.len() == 1 {
+        format!("{header}{params} -> {ret}")
+    } else {
+        format!("{header}({params}) -> {ret}")
+    }
+}
+
+/// Pretty-print a `MappingScheme` as `lhs <-> rhs` plus quantifiers.
+fn format_mapping_signature(scheme: &MappingScheme) -> String {
+    let mut header = String::new();
+    if !scheme.quantifiers.is_empty() || !scheme.constraints.is_empty() {
+        header.push_str("forall ");
+        let parts = scheme
+            .quantifiers
+            .iter()
+            .cloned()
+            .chain(scheme.constraints.iter().map(|c| c.text.clone()))
+            .collect::<Vec<_>>();
+        header.push_str(&parts.join(", "));
+        header.push_str(". ");
+    }
+    format!("{header}{} <-> {}", scheme.lhs.display_text(), scheme.rhs.display_text())
+}
+
+/// Map a typechecker `Ty` into the language-agnostic `MatchTy` consumed
+/// by the pattern usefulness algorithm. Anything outside the supported
+/// subset (functions, vars, App-with-args we don't model) collapses to
+/// `Unknown`, which the algorithm treats as having an unlistable
+/// constructor universe (i.e. a wildcard arm is required).
+fn ty_to_match_ty(ty: &Ty) -> MatchTy {
+    match ty.kind() {
+        TyData::Text(name) if name == "bool" => MatchTy::Bool,
+        TyData::Text(name) => MatchTy::Named(name.clone()),
+        TyData::App { name, .. } => MatchTy::Named(name.clone()),
+        TyData::Tuple(items) => MatchTy::Tuple(items.iter().map(ty_to_match_ty).collect()),
+        TyData::Unknown | TyData::Var(_) | TyData::Function { .. } => MatchTy::Unknown,
     }
 }
 
@@ -3157,6 +3632,13 @@ struct Checker<'a> {
     expr_types: HashMap<SpanKey, String>,
     binding_types: HashMap<SpanKey, String>,
     seen_errors: HashSet<(DiagnosticCode, usize, usize, TypeError)>,
+    cancel: CancellationToken,
+    /// Set to `true` while we're walking an l-expression's call form
+    /// (e.g. the LHS of `wX(idx) = data`). The cross-file arity check
+    /// uses this to allow `arg_count == total - 1`, since Sail's setter
+    /// desugaring leaves the LHS call site one argument short of the
+    /// underlying signature.
+    in_lexp_call: bool,
 }
 
 struct ConcatOperandInfo {
@@ -3167,6 +3649,15 @@ struct ConcatOperandInfo {
 
 impl<'a> Checker<'a> {
     fn new(file: &'a File, env: TopLevelEnv, pattern_constants: HashSet<String>) -> Self {
+        Self::with_cancel(file, env, pattern_constants, CancellationToken::never())
+    }
+
+    fn with_cancel(
+        file: &'a File,
+        env: TopLevelEnv,
+        pattern_constants: HashSet<String>,
+        cancel: CancellationToken,
+    ) -> Self {
         Self {
             file,
             source: file.source.text(),
@@ -3176,6 +3667,8 @@ impl<'a> Checker<'a> {
             expr_types: HashMap::new(),
             binding_types: HashMap::new(),
             seen_errors: HashSet::new(),
+            cancel,
+            in_lexp_call: false,
         }
     }
 
@@ -3217,13 +3710,13 @@ impl<'a> Checker<'a> {
 
     fn record_expr_type(&mut self, span: Span, ty: &Ty) {
         if !ty.is_unknown() {
-            self.expr_types.insert((span.start, span.end), ty.text());
+            self.expr_types.insert((span.start, span.end), ty.display_text());
         }
     }
 
     fn record_binding_type(&mut self, span: Span, ty: &Ty) {
         if !ty.is_unknown() {
-            self.binding_types.insert((span.start, span.end), ty.text());
+            self.binding_types.insert((span.start, span.end), ty.display_text());
         }
     }
 
@@ -3241,12 +3734,12 @@ impl<'a> Checker<'a> {
         // (functions, constants, registers) that the per-file type checker
         // cannot resolve. Reporting subtype errors against Unknown produces
         // thousands of false positives.
-        if matches!(actual, Ty::Unknown) || matches!(expected, Ty::Unknown) {
+        if actual.is_unknown() || expected.is_unknown() {
             return true;
         }
         // Type variables (e.g. polymorphic 'm, 'n in `forall 'n. bits('n)`)
         // should match any type for LSP purposes — we don't track kinds.
-        if matches!(actual, Ty::Var(_)) || matches!(expected, Ty::Var(_)) {
+        if matches!(actual.kind(), TyData::Var(_)) || matches!(expected.kind(), TyData::Var(_)) {
             return true;
         }
         // Resolve type aliases on both sides (e.g. xlenbits → bits(64)) before
@@ -3261,8 +3754,8 @@ impl<'a> Checker<'a> {
                 DiagnosticCode::TypeError,
                 span,
                 TypeError::Subtype {
-                    lhs: actual.text(),
-                    rhs: expected.text(),
+                    lhs: actual.display_text(),
+                    rhs: expected.display_text(),
                     constraint: None,
                 },
             );
@@ -3271,7 +3764,7 @@ impl<'a> Checker<'a> {
     }
 
     fn expect_int_type(&mut self, span: Span, actual: &Ty) -> bool {
-        self.expect_type(span, actual, &Ty::Text("int".to_string()))
+        self.expect_type(span, actual, &Ty::text("int".to_string()))
     }
 
     fn quantifier_is_bound(&self, name: &str, subst: &Subst) -> bool {
@@ -3376,13 +3869,14 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn instantiation_error(
+    fn instantiation_error_with_sig(
         &self,
         id: &str,
         quantifiers: &[String],
         constraints: &[QuantConstraint],
         subst: &Subst,
         assumptions: &[ConstraintExpr],
+        signature: Option<String>,
     ) -> Option<TypeError> {
         let mut unresolved = quantifiers
             .iter()
@@ -3418,6 +3912,7 @@ impl<'a> Checker<'a> {
         (!unresolved.is_empty()).then_some(TypeError::UnresolvedQuants {
             id: id.to_string(),
             quants: unresolved,
+            signature,
         })
     }
 
@@ -3442,21 +3937,21 @@ impl<'a> Checker<'a> {
     }
 
     fn record_info_for_type(&self, ty: &Ty) -> Option<(String, RecordInfo, Subst)> {
-        match ty {
-            Ty::Text(name) => self
+        match ty.kind() {
+            TyData::Text(name) => self
                 .env
                 .records
                 .get(name)
                 .cloned()
                 .map(|info| (name.clone(), info, Subst::default())),
-            Ty::App { name, args, .. } => {
+            TyData::App { name, args, .. } => {
                 let info = self.env.records.get(name)?.clone();
                 let mut subst = Subst::default();
                 for (param, arg) in info.params.iter().zip(args.iter()) {
                     match arg {
                         TyArg::Type(ty) => {
-                            subst.types.insert(param.clone(), (**ty).clone());
-                            subst.values.insert(param.clone(), ty.text());
+                            subst.types.insert(param.clone(), ty.clone());
+                            subst.values.insert(param.clone(), ty.display_text());
                         }
                         TyArg::Value(value) => {
                             subst.values.insert(param.clone(), value.clone());
@@ -3481,8 +3976,8 @@ impl<'a> Checker<'a> {
     }
 
     fn bitfield_info_for_type(&self, ty: &Ty) -> Option<(String, BitfieldInfo)> {
-        match ty {
-            Ty::Text(name) => self
+        match ty.kind() {
+            TyData::Text(name) => self
                 .env
                 .bitfields
                 .get(name)
@@ -3682,29 +4177,41 @@ impl<'a> Checker<'a> {
             }
             Lexp::Deref(expr) => {
                 let inner_ty = self.infer_expr(expr, locals);
-                match inner_ty {
-                    Ty::App { name, args, .. } if name == "register" => args
-                        .into_iter()
+                match inner_ty.kind() {
+                    TyData::App { name, args, .. } if name == "register" => args
+                        .iter()
                         .next()
                         .and_then(|arg| match arg {
-                            TyArg::Type(ty) => Some(*ty),
+                            TyArg::Type(ty) => Some(ty.clone()),
                             TyArg::Value(_) => None,
                         })
-                        .unwrap_or(Ty::Unknown),
-                    other => {
+                        .unwrap_or(Ty::unknown()),
+                    _ => {
                         self.push_error(
                             DiagnosticCode::TypeError,
                             lexp.1,
                             TypeError::other(format!(
                                 "Cannot dereference non-register type {}",
-                                other.text()
+                                inner_ty.display_text()
                             )),
                         );
-                        Ty::Unknown
+                        Ty::unknown()
                     }
                 }
             }
-            _ => self.infer_expr(&self.lexp_to_expr(lexp), locals),
+            _ => {
+                // Mark the recursive infer_expr call as l-expression
+                // context so the cross-file arity check tolerates the
+                // setter-desugaring "off by one" pattern (`wX(idx) =
+                // data` parses as a 1-arg call but the underlying
+                // signature expects 2 args).
+                let prev = self.in_lexp_call;
+                self.in_lexp_call = true;
+                let lowered = self.lexp_to_expr(lexp);
+                let ty = self.infer_expr(&lowered, locals);
+                self.in_lexp_call = prev;
+                ty
+            }
         }
     }
 
@@ -3758,30 +4265,30 @@ impl<'a> Checker<'a> {
     }
 
     fn collection_element_type(&self, ty: &Ty) -> Option<Ty> {
-        match ty {
-            Ty::App { name, args, .. } if name == "list" => {
+        match ty.kind() {
+            TyData::App { name, args, .. } if name == "list" => {
                 args.first().and_then(|arg| match arg {
-                    TyArg::Type(ty) => Some((**ty).clone()),
+                    TyArg::Type(ty) => Some(ty.clone()),
                     TyArg::Value(_) => None,
                 })
             }
-            Ty::App { name, args, .. } if name == "vector" => {
+            TyData::App { name, args, .. } if name == "vector" => {
                 args.last().and_then(|arg| match arg {
-                    TyArg::Type(ty) => Some((**ty).clone()),
+                    TyArg::Type(ty) => Some(ty.clone()),
                     TyArg::Value(_) => None,
                 })
             }
-            Ty::App { name, .. } if name == "bits" => Some(Ty::Text("bit".to_string())),
+            TyData::App { name, .. } if name == "bits" => Some(Ty::text("bit".to_string())),
             _ => None,
         }
     }
 
     fn collection_length_text(&self, ty: &Ty) -> Option<String> {
-        match ty {
-            Ty::App { name, args, .. } if name == "vector" || name == "bits" => {
+        match ty.kind() {
+            TyData::App { name, args, .. } if name == "vector" || name == "bits" => {
                 args.first().and_then(|arg| match arg {
                     TyArg::Value(value) => Some(value.clone()),
-                    TyArg::Type(ty) => Some(ty.text()),
+                    TyArg::Type(ty) => Some(ty.display_text()),
                 })
             }
             _ => None,
@@ -3794,9 +4301,9 @@ impl<'a> Checker<'a> {
     }
 
     fn collection_slice_type(&self, ty: &Ty, len_text: String) -> Option<Ty> {
-        match ty {
-            Ty::App { name, .. } if name == "bits" => Some(bits_ty(len_text)),
-            Ty::App { name, .. } if name == "vector" => self
+        match ty.kind() {
+            TyData::App { name, .. } if name == "bits" => Some(bits_ty(len_text)),
+            TyData::App { name, .. } if name == "vector" => self
                 .collection_element_type(ty)
                 .map(|elem_ty| vector_ty(len_text, elem_ty)),
             _ => None,
@@ -4041,7 +4548,7 @@ impl<'a> Checker<'a> {
                 call.callee.1,
                 TypeError::other(format!("Expected 3 arguments, found {}", call.args.len())),
             );
-            return Ty::Unknown;
+            return Ty::unknown();
         }
 
         let start_ty = &arg_types[1];
@@ -4077,7 +4584,7 @@ impl<'a> Checker<'a> {
                 call.callee.1,
                 TypeError::other(format!("Expected 2 arguments, found {}", call.args.len())),
             );
-            return Ty::Unknown;
+            return Ty::unknown();
         }
 
         let base_ty = self.infer_expr(&call.args[0], locals);
@@ -4100,7 +4607,7 @@ impl<'a> Checker<'a> {
                                     field_name, bitfield_name
                                 )),
                             );
-                            Ty::Unknown
+                            Ty::unknown()
                         };
                     if let Some(expected_ret) = expected_ret {
                         self.expect_type(call_span, &field_ty, expected_ret);
@@ -4117,7 +4624,7 @@ impl<'a> Checker<'a> {
                                 .to_string(),
                         ),
                     );
-                    return Ty::Unknown;
+                    return Ty::unknown();
                 }
             }
         }
@@ -4126,14 +4633,14 @@ impl<'a> Checker<'a> {
         // it may be a cross-file bitfield we don't have info for. Return
         // Unknown without trying to type-check the "index" — which might
         // actually be a field name that looks like an enum member elsewhere.
-        let base_text = base_ty.text();
+        let base_text = base_ty.display_text();
         let is_recognized_collection = base_text.starts_with("bits(")
             || base_text.starts_with("vector(")
             || base_text.starts_with("list(")
             || base_text == "bit";
-        if !is_recognized_collection && !matches!(base_ty, Ty::Unknown) {
+        if !is_recognized_collection && !base_ty.is_unknown() {
             self.infer_expr(&call.args[1], locals);
-            return Ty::Unknown;
+            return Ty::unknown();
         }
 
         let index_ty = self.infer_expr(&call.args[1], locals);
@@ -4141,7 +4648,7 @@ impl<'a> Checker<'a> {
         self.check_collection_index_bounds(&call.args[1], &base_ty, locals);
         let result_ty = self
             .collection_element_type(&base_ty)
-            .unwrap_or(Ty::Unknown);
+            .unwrap_or(Ty::unknown());
         if let Some(expected_ret) = expected_ret {
             self.expect_type(call_span, &result_ty, expected_ret);
         }
@@ -4160,7 +4667,7 @@ impl<'a> Checker<'a> {
                 call.callee.1,
                 TypeError::other(format!("Expected 3 arguments, found {}", call.args.len())),
             );
-            return Ty::Unknown;
+            return Ty::unknown();
         }
 
         let base_ty = self.infer_expr(&call.args[0], locals);
@@ -4200,7 +4707,7 @@ impl<'a> Checker<'a> {
                 call.callee.1,
                 TypeError::other(format!("Expected 3 arguments, found {}", call.args.len())),
             );
-            return Ty::Unknown;
+            return Ty::unknown();
         }
 
         let update = (
@@ -4235,7 +4742,7 @@ impl<'a> Checker<'a> {
                 call.callee.1,
                 TypeError::other(format!("Expected 4 arguments, found {}", call.args.len())),
             );
-            return Ty::Unknown;
+            return Ty::unknown();
         }
 
         let update = (
@@ -4616,7 +5123,7 @@ impl<'a> Checker<'a> {
                                         *left_span,
                                         Box::new(TypeError::Hint(format!(
                                             "has type {}",
-                                            left_ty.text()
+                                            left_ty.display_text()
                                         ))),
                                     ),
                                     (
@@ -4624,7 +5131,7 @@ impl<'a> Checker<'a> {
                                         *right_span,
                                         Box::new(TypeError::Hint(format!(
                                             "has type {}",
-                                            right_ty.text()
+                                            right_ty.display_text()
                                         ))),
                                     ),
                                 ],
@@ -4678,7 +5185,7 @@ impl<'a> Checker<'a> {
                     }
                 }
             }
-            return Ty::Unknown;
+            return Ty::unknown();
         };
 
         let Some(record_info) = self.env.records.get(&name.0).cloned() else {
@@ -4687,10 +5194,10 @@ impl<'a> Checker<'a> {
                 name.1,
                 TypeError::other(format!("Unknown record type {}", name.0)),
             );
-            return Ty::Unknown;
+            return Ty::unknown();
         };
 
-        let record_ty = Ty::Text(name.0.clone());
+        let record_ty = Ty::text(name.0.clone());
         let mut remaining_fields = record_info.fields.keys().cloned().collect::<HashSet<_>>();
 
         for field in fields {
@@ -4768,14 +5275,14 @@ impl<'a> Checker<'a> {
         let bitfield_name = self.bitfield_info_for_type(&base_ty).map(|(name, _)| name);
         if record_name.is_none() && bitfield_name.is_none() {
             if !is_known_non_record(&base_ty) {
-                return Ty::Unknown;
+                return Ty::unknown();
             }
             self.push_error(
                 DiagnosticCode::TypeError,
                 base.1,
-                TypeError::other(format!("The type {} is not a record", base_ty.text())),
+                TypeError::other(format!("The type {} is not a record", base_ty.display_text())),
             );
-            return Ty::Unknown;
+            return Ty::unknown();
         }
 
         for field in fields {
@@ -5010,7 +5517,7 @@ impl<'a> Checker<'a> {
                         value,
                         &self
                             .record_field_type(expected, &field_name)
-                            .unwrap_or(Ty::Unknown),
+                            .unwrap_or(Ty::unknown()),
                         locals,
                     );
                     if self.record_field_type(expected, &field_name).is_none() {
@@ -5091,14 +5598,14 @@ impl<'a> Checker<'a> {
         if record_name.is_none() && bitfield_name.is_none() {
             // Skip the error for cross-file type aliases / unknown types.
             if !is_known_non_record(&record_ty) {
-                return Ty::Unknown;
+                return Ty::unknown();
             }
             self.push_error(
                 DiagnosticCode::TypeError,
                 base.1,
-                TypeError::other(format!("The type {} is not a record", record_ty.text())),
+                TypeError::other(format!("The type {} is not a record", record_ty.display_text())),
             );
-            return Ty::Unknown;
+            return Ty::unknown();
         }
 
         for field in fields {
@@ -5300,8 +5807,8 @@ impl<'a> Checker<'a> {
         locals: &mut LocalEnv,
         name: &str,
     ) -> Ty {
-        match expected {
-            Ty::App {
+        match expected.kind() {
+            TyData::App {
                 name: expected_name,
                 ..
             } if expected_name == name => {
@@ -5316,8 +5823,8 @@ impl<'a> Checker<'a> {
                                 DiagnosticCode::TypeError,
                                 span,
                                 TypeError::Subtype {
-                                    lhs: vector_ty(actual_len, Ty::Unknown).text(),
-                                    rhs: expected.text(),
+                                    lhs: vector_ty(actual_len, Ty::unknown()).display_text(),
+                                    rhs: expected.display_text(),
                                     constraint: None,
                                 },
                             );
@@ -5358,8 +5865,8 @@ impl<'a> Checker<'a> {
         expected: &Ty,
         locals: &mut LocalEnv,
     ) -> Ty {
-        match expected {
-            Ty::Tuple(expected_items) if expected_items.len() == items.len() => {
+        match expected.kind() {
+            TyData::Tuple(expected_items) if expected_items.len() == items.len() => {
                 for (item, expected_item) in items.iter().zip(expected_items.iter()) {
                     self.check_expr(item, expected_item, locals);
                 }
@@ -5471,7 +5978,7 @@ impl<'a> Checker<'a> {
             }
             Expr::Block(items) => {
                 locals.push_scope();
-                let mut last_ty = Ty::Text("unit".to_string());
+                let mut last_ty = Ty::text("unit".to_string());
                 for (index, item) in items.iter().enumerate() {
                     match &item.0 {
                         sail_parser::BlockItem::Let(binding) => {
@@ -5500,12 +6007,12 @@ impl<'a> Checker<'a> {
                                 self.infer_expr(&binding.value, locals)
                             };
                             self.bind_pattern(&binding.pattern, Some(value_ty), locals);
-                            Ty::Text("unit".to_string())
+                            Ty::text("unit".to_string())
                         }
                         sail_parser::BlockItem::Var { target, value } => {
                             let value_ty = self.infer_var_target_value(target, value, locals);
                             self.bind_var_target_declaration(target, &value_ty, locals);
-                            Ty::Text("unit".to_string())
+                            Ty::text("unit".to_string())
                         }
                         sail_parser::BlockItem::Expr(inner) if is_last => {
                             self.check_expr(inner, expected, locals)
@@ -5525,7 +6032,7 @@ impl<'a> Checker<'a> {
                 {
                     last_ty
                 } else {
-                    let unit_ty = Ty::Text("unit".to_string());
+                    let unit_ty = Ty::text("unit".to_string());
                     self.expect_type(expr.1, &unit_ty, expected);
                     unit_ty
                 }
@@ -5536,11 +6043,11 @@ impl<'a> Checker<'a> {
                 else_branch,
             } => {
                 let cond_ty = self.infer_expr(cond, locals);
-                self.expect_type(cond.1, &cond_ty, &Ty::Text("bool".to_string()));
+                self.expect_type(cond.1, &cond_ty, &Ty::text("bool".to_string()));
                 let branch_expected = if else_branch.is_some() {
                     expected.clone()
                 } else {
-                    Ty::Text("unit".to_string())
+                    Ty::text("unit".to_string())
                 };
                 let then_mark = locals.snapshot();
                 self.add_expr_constraint(locals, cond, true);
@@ -5553,7 +6060,7 @@ impl<'a> Checker<'a> {
                     locals.restore(else_mark);
                     expected.clone()
                 } else {
-                    let unit_ty = Ty::Text("unit".to_string());
+                    let unit_ty = Ty::text("unit".to_string());
                     self.expect_type(expr.1, &unit_ty, expected);
                     unit_ty
                 }
@@ -5589,6 +6096,11 @@ impl<'a> Checker<'a> {
     fn check_source_file(mut self, ast: &SourceFile) -> TypeCheckResult {
         let mut global_constraints = Vec::new();
         for (item, span) in &ast.defs {
+            // Cooperative cancellation: bail out at the next top-level
+            // definition boundary if a newer typecheck has been queued.
+            if self.cancel.is_cancelled() {
+                break;
+            }
             match &item.kind {
                 DefinitionKind::Callable(def) => {
                     self.trace_typecheck("callable", &def.name.0, Some(*span));
@@ -5632,13 +6144,13 @@ impl<'a> Checker<'a> {
             return;
         };
         let underlying = type_from_type_expr(self.source, ty);
-        let width_is_known = match &underlying {
-            Ty::App { name, args, .. } if name == "bits" => args
+        let width_is_known = match underlying.kind() {
+            TyData::App { name, args, .. } if name == "bits" => args
                 .first()
                 .and_then(|arg| match arg {
                     TyArg::Value(value) => parse_numeric_expr_text(value)
                         .and_then(|expr| eval_numeric_expr(&expr, &Subst::default(), &[])),
-                    TyArg::Type(inner) => parse_numeric_expr_text(&inner.text())
+                    TyArg::Type(inner) => parse_numeric_expr_text(&inner.display_text())
                         .and_then(|expr| eval_numeric_expr(&expr, &Subst::default(), &[])),
                 })
                 .is_some(),
@@ -5646,15 +6158,15 @@ impl<'a> Checker<'a> {
         };
         // If the underlying type is a non-`bits` type alias (e.g. xlenbits),
         // we cannot resolve it without cross-file context. Be permissive.
-        let is_cross_file_alias = !matches!(&underlying,
-            Ty::App { name, .. } if name == "bits") && !matches!(&underlying, Ty::Unknown);
+        let is_cross_file_alias = !matches!(underlying.kind(),
+            TyData::App { name, .. } if name == "bits") && !underlying.is_unknown();
         if !width_is_known && !is_cross_file_alias {
             self.push_error(
                 DiagnosticCode::TypeError,
                 ty.1,
                 TypeError::other(format!(
                     "Underlying bitfield type {} must be a constant-width bitvector",
-                    underlying.text()
+                    underlying.display_text()
                 )),
             );
         }
@@ -5711,7 +6223,7 @@ impl<'a> Checker<'a> {
             return;
         }
 
-        let expected_scheme = self
+        let expected_scheme: Option<Arc<TypeScheme>> = self
             .env
             .functions
             .get(&def.name.0)
@@ -5719,9 +6231,9 @@ impl<'a> Checker<'a> {
             .or_else(|| {
                 def.signature
                     .as_ref()
-                    .map(|ty| scheme_from_type_expr(self.source, ty))
+                    .map(|ty| Arc::new(scheme_from_type_expr(self.source, ty)))
             })
-            .or_else(|| scheme_from_callable_head(self.source, def));
+            .or_else(|| scheme_from_callable_head(self.source, def).map(Arc::new));
 
         if def.clauses.is_empty() {
             let mut locals =
@@ -5746,7 +6258,7 @@ impl<'a> Checker<'a> {
         }
 
         for clause in &def.clauses {
-            self.check_callable_clause(clause, expected_scheme.as_ref());
+            self.check_callable_clause(clause, expected_scheme.as_deref());
         }
     }
 
@@ -5765,7 +6277,7 @@ impl<'a> Checker<'a> {
             // reference to it would fire as "Unresolved identifier".
             let mut param_tys = scheme.params.clone();
             if param_tys.len() == 1 && clause.0.patterns.len() > 1 {
-                if let Ty::Tuple(items) = &param_tys[0] {
+                if let TyData::Tuple(items) = param_tys[0].kind() {
                     if items.len() == clause.0.patterns.len() {
                         param_tys = items.clone();
                     }
@@ -5782,14 +6294,14 @@ impl<'a> Checker<'a> {
         if let Some(guard) = &clause.0.guard {
             let guard_ty = self.infer_expr(guard, &mut locals);
             let mut subst = Subst::default();
-            if !matches!(guard_ty, Ty::Unknown)
-                && !unify(&Ty::Text("bool".to_string()), &guard_ty, &mut subst)
+            if !guard_ty.is_unknown()
+                && !unify(&Ty::text("bool".to_string()), &guard_ty, &mut subst)
             {
                 self.push_error(
                     DiagnosticCode::TypeError,
                     guard.1,
                     TypeError::Subtype {
-                        lhs: guard_ty.text(),
+                        lhs: guard_ty.display_text(),
                         rhs: "bool".to_string(),
                         constraint: None,
                     },
@@ -5868,10 +6380,11 @@ impl<'a> Checker<'a> {
             _ => None,
         };
         let vector_elem_ty = self.collection_element_type(expected_ty);
-        let expected_is_vector = matches!(expected_ty, Ty::App { name, .. } if name == "vector");
+        let expected_is_vector =
+            matches!(expected_ty.kind(), TyData::App { name, .. } if name == "vector");
         let mk_expected = |width| {
             if expected_is_vector {
-                vector_ty(width, vector_elem_ty.clone().unwrap_or(Ty::Unknown))
+                vector_ty(width, vector_elem_ty.clone().unwrap_or(Ty::unknown()))
             } else {
                 bits_ty(width)
             }
@@ -5893,7 +6406,7 @@ impl<'a> Checker<'a> {
     ) {
         let record_ty = expected_ty
             .clone()
-            .or_else(|| name.as_ref().map(|name| Ty::Text(name.0.clone())));
+            .or_else(|| name.as_ref().map(|name| Ty::text(name.0.clone())));
         let record_info = record_ty
             .as_ref()
             .and_then(|record_ty| self.record_info_for_type(record_ty));
@@ -5929,7 +6442,7 @@ impl<'a> Checker<'a> {
                 self.push_error(
                     DiagnosticCode::TypeError,
                     pattern_span,
-                    TypeError::other(format!("The type {} is not a record", expected.text())),
+                    TypeError::other(format!("The type {} is not a record", expected.display_text())),
                 );
             }
         }
@@ -5967,7 +6480,7 @@ impl<'a> Checker<'a> {
                     let expected = record_ty
                         .as_ref()
                         .and_then(|record_ty| self.record_field_type(record_ty, &field_name.0))
-                        .unwrap_or(Ty::Unknown);
+                        .unwrap_or(Ty::unknown());
                     if expected.is_unknown() && record_info.is_some() {
                         self.push_error(
                             DiagnosticCode::TypeError,
@@ -6026,7 +6539,7 @@ impl<'a> Checker<'a> {
             }
             Pattern::Ident(name) => {
                 if is_pattern_binding(name, &self.pattern_constants, self.env.has_workspace_context) {
-                    let ty = expected_ty.unwrap_or(Ty::Unknown);
+                    let ty = expected_ty.unwrap_or(Ty::unknown());
                     locals.define(name, ty.clone());
                     self.record_binding_type(pattern.1, &ty);
                 }
@@ -6035,16 +6548,16 @@ impl<'a> Checker<'a> {
                 let annotated = type_from_type_expr(self.source, ty);
                 if let Some(expected) = expected_ty {
                     let mut subst = Subst::default();
-                    if !matches!(expected, Ty::Unknown)
-                        && !matches!(annotated, Ty::Unknown)
+                    if !expected.is_unknown()
+                        && !annotated.is_unknown()
                         && !unify(&annotated, &expected, &mut subst)
                     {
                         self.push_error(
                             DiagnosticCode::TypeError,
                             ty.1,
                             TypeError::Subtype {
-                                lhs: expected.text(),
-                                rhs: annotated.text(),
+                                lhs: expected.display_text(),
+                                rhs: annotated.display_text(),
                                 constraint: None,
                             },
                         );
@@ -6057,22 +6570,33 @@ impl<'a> Checker<'a> {
                 binding,
             } => {
                 self.bind_pattern_inner(inner, expected_ty.clone(), locals);
-                let ty = expected_ty.unwrap_or(Ty::Unknown);
+                let ty = expected_ty.unwrap_or(Ty::unknown());
                 locals.define(&binding.0, ty.clone());
                 self.record_binding_type(binding.1, &ty);
             }
             Pattern::Tuple(items) => {
-                let tuple_items = match expected_ty {
-                    Some(Ty::Tuple(expected_items)) if expected_items.len() == items.len() => {
-                        Some(expected_items)
+                let tuple_items = match expected_ty.as_ref().map(|t| t.kind()) {
+                    Some(TyData::Tuple(expected_items))
+                        if expected_items.len() == items.len() =>
+                    {
+                        Some(expected_items.clone())
                     }
-                    Some(expected) if !expected.is_unknown() => {
+                    Some(_)
+                        if !expected_ty
+                            .as_ref()
+                            .map(|t| t.is_unknown())
+                            .unwrap_or(true) =>
+                    {
+                        let display = expected_ty
+                            .as_ref()
+                            .map(|t| t.display_text())
+                            .unwrap_or_default();
                         self.push_error(
                             DiagnosticCode::TypeError,
                             pattern.1,
                             TypeError::other(format!(
                                 "Cannot bind tuple pattern against non tuple type {}",
-                                expected.text()
+                                display
                             )),
                         );
                         None
@@ -6101,7 +6625,7 @@ impl<'a> Checker<'a> {
                 }
             }
             Pattern::App { args, callee } => {
-                let expected_ty = expected_ty.unwrap_or(Ty::Unknown);
+                let expected_ty = expected_ty.unwrap_or(Ty::unknown());
                 let candidates = self.env.lookup_constructors(&callee.0);
                 let mappings = self.env.lookup_mappings(&callee.0);
                 let mut assumptions = Vec::new();
@@ -6138,14 +6662,16 @@ impl<'a> Checker<'a> {
 
                             let mut first_mapping_error = None;
                             for mapping in mappings {
+                                let sig = format_mapping_signature(mapping.as_ref());
                                 let mut backwards_subst = Subst::default();
                                 if unify(&mapping.rhs, &expected_ty, &mut backwards_subst) {
-                                    if let Some(error) = self.instantiation_error(
+                                    if let Some(error) = self.instantiation_error_with_sig(
                                         &callee.0,
                                         &mapping.quantifiers,
                                         &mapping.constraints,
                                         &backwards_subst,
                                         &assumptions,
+                                        Some(sig.clone()),
                                     ) {
                                         first_mapping_error.get_or_insert(error);
                                     } else {
@@ -6160,12 +6686,13 @@ impl<'a> Checker<'a> {
 
                                 let mut forwards_subst = Subst::default();
                                 if unify(&mapping.lhs, &expected_ty, &mut forwards_subst) {
-                                    if let Some(error) = self.instantiation_error(
+                                    if let Some(error) = self.instantiation_error_with_sig(
                                         &callee.0,
                                         &mapping.quantifiers,
                                         &mapping.constraints,
                                         &forwards_subst,
                                         &assumptions,
+                                        Some(sig),
                                     ) {
                                         first_mapping_error.get_or_insert(error);
                                     } else {
@@ -6188,7 +6715,7 @@ impl<'a> Checker<'a> {
                                     TypeError::other(format!(
                                         "Pattern {} does not match type {}",
                                         callee.0,
-                                        expected_ty.text()
+                                        expected_ty.display_text()
                                     )),
                                 );
                             }
@@ -6207,7 +6734,7 @@ impl<'a> Checker<'a> {
                 for candidate in candidates {
                     let mut candidate_params = candidate.params.clone();
                     if args.len() != candidate_params.len() && candidate_params.len() == 1 {
-                        if let Ty::Tuple(items) = &candidate_params[0] {
+                        if let TyData::Tuple(items) = candidate_params[0].kind() {
                             if items.len() == args.len() {
                                 candidate_params = items.clone();
                             }
@@ -6223,12 +6750,13 @@ impl<'a> Checker<'a> {
                     {
                         continue;
                     }
-                    if let Some(error) = self.instantiation_error(
+                    if let Some(error) = self.instantiation_error_with_sig(
                         &callee.0,
                         &candidate.quantifiers,
                         &candidate.constraints,
                         &subst,
                         &assumptions,
+                        Some(format_scheme_signature(candidate.as_ref())),
                     ) {
                         first_candidate_error.get_or_insert(error);
                         continue;
@@ -6260,7 +6788,7 @@ impl<'a> Checker<'a> {
                         TypeError::other(format!(
                             "Pattern {} does not match type {}",
                             callee.0,
-                            expected_ty.text()
+                            expected_ty.display_text()
                         )),
                     );
                 }
@@ -6277,7 +6805,7 @@ impl<'a> Checker<'a> {
                                 pattern.1,
                                 TypeError::other(format!(
                                     "Cannot match cons pattern against non-list type {}",
-                                    expected.text()
+                                    expected.display_text()
                                 )),
                             );
                         }
@@ -6289,8 +6817,8 @@ impl<'a> Checker<'a> {
                 "^" => {
                     let string_ty = match expected_ty.as_ref() {
                         Some(expected)
-                            if expected.text() == "string"
-                                || expected.text() == "string_literal" =>
+                            if expected.display_text() == "string"
+                                || expected.display_text() == "string_literal" =>
                         {
                             expected.clone()
                         }
@@ -6300,12 +6828,12 @@ impl<'a> Checker<'a> {
                                 pattern.1,
                                 TypeError::other(format!(
                                     "Cannot match string-append pattern against non-string type {}",
-                                    expected.text()
+                                    expected.display_text()
                                 )),
                             );
-                            Ty::Text("string".to_string())
+                            Ty::text("string".to_string())
                         }
-                        _ => Ty::Text("string".to_string()),
+                        _ => Ty::text("string".to_string()),
                     };
                     self.bind_pattern_inner(lhs, Some(string_ty.clone()), locals);
                     self.bind_pattern_inner(rhs, Some(string_ty), locals);
@@ -6346,7 +6874,7 @@ impl<'a> Checker<'a> {
                 // lexer currently carries the leading `'` through, so
                 // strip it before defining the value binding.
                 let value_name = name.strip_prefix('\'').unwrap_or(name);
-                let ty = expected_ty.unwrap_or(Ty::Unknown);
+                let ty = expected_ty.unwrap_or(Ty::unknown());
                 locals.define(value_name, ty.clone());
                 self.record_binding_type(pattern.1, &ty);
             }
@@ -6408,7 +6936,7 @@ impl<'a> Checker<'a> {
                 // not the rhs type. (Previously returned rhs_ty, which caused
                 // false-positive "X is not a subtype of unit" errors when the
                 // assignment was the last expression of a unit-returning fn.)
-                Ty::Text("unit".to_string())
+                Ty::text("unit".to_string())
             }
             Expr::Let { binding, body } => {
                 let value_ty = if let Some(expected_bind) =
@@ -6439,7 +6967,7 @@ impl<'a> Checker<'a> {
             }
             Expr::Block(items) => {
                 locals.push_scope();
-                let mut last_ty = Ty::Text("unit".to_string());
+                let mut last_ty = Ty::text("unit".to_string());
                 for item in items {
                     match &item.0 {
                         sail_parser::BlockItem::Let(binding) => {
@@ -6467,12 +6995,12 @@ impl<'a> Checker<'a> {
                                 self.infer_expr(&binding.value, locals)
                             };
                             self.bind_pattern(&binding.pattern, Some(value_ty), locals);
-                            Ty::Text("unit".to_string())
+                            Ty::text("unit".to_string())
                         }
                         sail_parser::BlockItem::Var { target, value } => {
                             let value_ty = self.infer_var_target_value(target, value, locals);
                             self.bind_var_target_declaration(target, &value_ty, locals);
-                            Ty::Text("unit".to_string())
+                            Ty::text("unit".to_string())
                         }
                         sail_parser::BlockItem::Expr(expr) => {
                             let ty = self.infer_expr(expr, locals);
@@ -6488,16 +7016,16 @@ impl<'a> Checker<'a> {
                 let value_ty = self.infer_expr(expr, locals);
                 if let Some(expected) = &locals.expected_return {
                     let mut subst = Subst::default();
-                    if !matches!(value_ty, Ty::Unknown)
-                        && !matches!(expected, Ty::Unknown)
+                    if !value_ty.is_unknown()
+                        && !expected.is_unknown()
                         && !unify(expected, &value_ty, &mut subst)
                     {
                         self.push_error(
                             DiagnosticCode::TypeError,
                             expr.1,
                             TypeError::Subtype {
-                                lhs: value_ty.text(),
-                                rhs: expected.text(),
+                                lhs: value_ty.display_text(),
+                                rhs: expected.display_text(),
                                 constraint: None,
                             },
                         );
@@ -6505,25 +7033,25 @@ impl<'a> Checker<'a> {
                 }
                 // `return` is diverging — return Unknown so it unifies with
                 // any sibling branch type.
-                Ty::Unknown
+                Ty::unknown()
             }
             Expr::Throw(expr) => {
                 self.infer_expr(expr, locals);
                 // `throw` is diverging — return Unknown so it unifies with any
                 // sibling branch type.
-                Ty::Unknown
+                Ty::unknown()
             }
             Expr::Assert { condition, message } => {
                 let cond_ty = self.infer_expr(condition, locals);
                 let mut subst = Subst::default();
-                if !matches!(cond_ty, Ty::Unknown)
-                    && !unify(&Ty::Text("bool".to_string()), &cond_ty, &mut subst)
+                if !cond_ty.is_unknown()
+                    && !unify(&Ty::text("bool".to_string()), &cond_ty, &mut subst)
                 {
                     self.push_error(
                         DiagnosticCode::TypeError,
                         condition.1,
                         TypeError::Subtype {
-                            lhs: cond_ty.text(),
+                            lhs: cond_ty.display_text(),
                             rhs: "bool".to_string(),
                             constraint: None,
                         },
@@ -6533,7 +7061,7 @@ impl<'a> Checker<'a> {
                     self.infer_expr(message, locals);
                 }
                 self.add_expr_constraint(locals, condition, true);
-                Ty::Text("unit".to_string())
+                Ty::text("unit".to_string())
             }
             Expr::Exit(expr) => {
                 if let Some(inner) = expr.as_ref() {
@@ -6543,7 +7071,7 @@ impl<'a> Checker<'a> {
                 // never returns. In a match/if branch alongside other arms,
                 // its type should unify with any sibling. Return Unknown so
                 // our case-type unifier treats it as compatible.
-                Ty::Unknown
+                Ty::unknown()
             }
             Expr::If {
                 cond,
@@ -6552,14 +7080,14 @@ impl<'a> Checker<'a> {
             } => {
                 let cond_ty = self.infer_expr(cond, locals);
                 let mut subst = Subst::default();
-                if !matches!(cond_ty, Ty::Unknown)
-                    && !unify(&Ty::Text("bool".to_string()), &cond_ty, &mut subst)
+                if !cond_ty.is_unknown()
+                    && !unify(&Ty::text("bool".to_string()), &cond_ty, &mut subst)
                 {
                     self.push_error(
                         DiagnosticCode::TypeError,
                         cond.1,
                         TypeError::Subtype {
-                            lhs: cond_ty.text(),
+                            lhs: cond_ty.display_text(),
                             rhs: "bool".to_string(),
                             constraint: None,
                         },
@@ -6578,13 +7106,13 @@ impl<'a> Checker<'a> {
                         locals.restore(else_mark);
                         else_ty
                     })
-                    .unwrap_or_else(|| Ty::Text("unit".to_string()));
+                    .unwrap_or_else(|| Ty::text("unit".to_string()));
                 let mut subst = Subst::default();
                 // If either branch diverges (Unknown), return the OTHER branch's
                 // type since the Unknown branch never completes.
-                if matches!(then_ty, Ty::Unknown) {
+                if then_ty.is_unknown() {
                     else_ty
-                } else if matches!(else_ty, Ty::Unknown) {
+                } else if else_ty.is_unknown() {
                     then_ty
                 } else if self.unify_with_aliases(&then_ty, &else_ty, &mut subst) {
                     apply_subst(&then_ty, &subst)
@@ -6593,12 +7121,12 @@ impl<'a> Checker<'a> {
                         DiagnosticCode::TypeError,
                         expr.1,
                         TypeError::Subtype {
-                            lhs: else_ty.text(),
-                            rhs: then_ty.text(),
+                            lhs: else_ty.display_text(),
+                            rhs: then_ty.display_text(),
                             constraint: None,
                         },
                     );
-                    Ty::Unknown
+                    Ty::unknown()
                 }
             }
             Expr::Match { scrutinee, cases } | Expr::Try { scrutinee, cases } => {
@@ -6619,12 +7147,12 @@ impl<'a> Checker<'a> {
                     .ty
                     .as_ref()
                     .map(|ty| type_from_type_expr(self.source, ty))
-                    .unwrap_or_else(|| Ty::Text("int".to_string()));
+                    .unwrap_or_else(|| Ty::text("int".to_string()));
                 locals.define(&foreach.iterator.0, iter_ty.clone());
                 self.record_binding_type(foreach.iterator.1, &iter_ty);
                 self.infer_expr(&foreach.body, locals);
                 locals.pop_scope();
-                Ty::Text("unit".to_string())
+                Ty::text("unit".to_string())
             }
             Expr::Repeat {
                 measure,
@@ -6637,20 +7165,20 @@ impl<'a> Checker<'a> {
                 self.infer_expr(body, locals);
                 let until_ty = self.infer_expr(until, locals);
                 let mut subst = Subst::default();
-                if !matches!(until_ty, Ty::Unknown)
-                    && !unify(&Ty::Text("bool".to_string()), &until_ty, &mut subst)
+                if !until_ty.is_unknown()
+                    && !unify(&Ty::text("bool".to_string()), &until_ty, &mut subst)
                 {
                     self.push_error(
                         DiagnosticCode::TypeError,
                         until.1,
                         TypeError::Subtype {
-                            lhs: until_ty.text(),
+                            lhs: until_ty.display_text(),
                             rhs: "bool".to_string(),
                             constraint: None,
                         },
                     );
                 }
-                Ty::Text("unit".to_string())
+                Ty::text("unit".to_string())
             }
             Expr::While {
                 measure,
@@ -6662,19 +7190,19 @@ impl<'a> Checker<'a> {
                 }
                 let cond_ty = self.infer_expr(cond, locals);
                 let mut subst = Subst::default();
-                if !unify(&Ty::Text("bool".to_string()), &cond_ty, &mut subst) {
+                if !unify(&Ty::text("bool".to_string()), &cond_ty, &mut subst) {
                     self.push_error(
                         DiagnosticCode::TypeError,
                         cond.1,
                         TypeError::Subtype {
-                            lhs: cond_ty.text(),
+                            lhs: cond_ty.display_text(),
                             rhs: "bool".to_string(),
                             constraint: None,
                         },
                     );
                 }
                 self.infer_expr(body, locals);
-                Ty::Text("unit".to_string())
+                Ty::text("unit".to_string())
             }
             Expr::Infix { lhs, op, rhs } => self.infer_infix(expr, lhs, op.0.as_str(), rhs, locals),
             Expr::Prefix { op, expr: inner } => {
@@ -6682,28 +7210,28 @@ impl<'a> Checker<'a> {
                 match op.0.as_str() {
                     "not" => {
                         let mut subst = Subst::default();
-                        if !matches!(inner_ty, Ty::Unknown)
-                            && !unify(&Ty::Text("bool".to_string()), &inner_ty, &mut subst)
+                        if !inner_ty.is_unknown()
+                            && !unify(&Ty::text("bool".to_string()), &inner_ty, &mut subst)
                         {
                             self.push_error(
                                 DiagnosticCode::TypeError,
                                 inner.1,
                                 TypeError::Subtype {
-                                    lhs: inner_ty.text(),
+                                    lhs: inner_ty.display_text(),
                                     rhs: "bool".to_string(),
                                     constraint: None,
                                 },
                             );
                         }
-                        Ty::Text("bool".to_string())
+                        Ty::text("bool".to_string())
                     }
                     // Negation and bitwise NOT preserve the inner type.
                     "-" | "~" => inner_ty,
-                    _ => Ty::Unknown,
+                    _ => Ty::unknown(),
                 }
             }
             Expr::Cast { ty, .. } => type_from_type_expr(self.source, ty),
-            Expr::Config(_) => Ty::Unknown,
+            Expr::Config(_) => Ty::unknown(),
             Expr::Literal(literal) => infer_literal_type(literal),
             Expr::Ident(name) => {
                 if let Some(ty) = self.env.lookup_value(locals, name) {
@@ -6726,10 +7254,10 @@ impl<'a> Checker<'a> {
                             TypeError::Other(format!("Unresolved identifier `{name}`")),
                         );
                     }
-                    Ty::Unknown
+                    Ty::unknown()
                 }
             }
-            Expr::TypeVar(name) => Ty::Var(name.clone()),
+            Expr::TypeVar(name) => Ty::var(name.clone()),
             Expr::Ref(name) => {
                 if let Some(ty) = self.register_type_for_name(&name.0) {
                     register_ty(ty)
@@ -6747,7 +7275,7 @@ impl<'a> Checker<'a> {
                             TypeError::Other(format!("Unresolved register `{}`", name.0)),
                         );
                     }
-                    Ty::Unknown
+                    Ty::unknown()
                 }
             }
             Expr::Call(call) => self.infer_call(call, locals, None),
@@ -6757,8 +7285,8 @@ impl<'a> Checker<'a> {
                 let base_ty = self.infer_expr(inner, locals);
                 // Field access on Unknown (typically from cross-file functions
                 // returning unresolved types) shouldn't produce errors.
-                if matches!(base_ty, Ty::Unknown) {
-                    return Ty::Unknown;
+                if base_ty.is_unknown() {
+                    return Ty::unknown();
                 }
                 match self.record_field_type(&base_ty, &field.0) {
                     Some(field_ty) => field_ty,
@@ -6771,7 +7299,7 @@ impl<'a> Checker<'a> {
                                     field.1,
                                     TypeError::other(format!(
                                         "Record {} has no field {}",
-                                        base_ty.text(),
+                                        base_ty.display_text(),
                                         field.0
                                     )),
                                 );
@@ -6792,55 +7320,55 @@ impl<'a> Checker<'a> {
                                 // or what fields it has. Skip the error to avoid
                                 // thousands of false positives.
                                 if !is_known_non_record(&base_ty) {
-                                    return Ty::Unknown;
+                                    return Ty::unknown();
                                 }
                                 self.push_error(
                                     DiagnosticCode::TypeError,
                                     inner.1,
                                     TypeError::other(format!(
                                         "The type {} is not a record",
-                                        base_ty.text()
+                                        base_ty.display_text()
                                     )),
                                 );
                             }
-                            Ty::Unknown
+                            Ty::unknown()
                         }
                     },
                 }
             }
-            Expr::SizeOf(_) => Ty::Text("int".to_string()),
-            Expr::Constraint(_) => Ty::Text("bool".to_string()),
+            Expr::SizeOf(_) => Ty::text("int".to_string()),
+            Expr::Constraint(_) => Ty::text("bool".to_string()),
             Expr::Struct { name, fields } => {
                 self.infer_struct_expr(expr.1, name.as_ref(), fields, locals)
             }
             Expr::Update { base, fields } => self.infer_update_expr(base, fields, locals),
             Expr::List(items) => infer_collection_type(self, items, locals, "list"),
             Expr::Vector(items) => infer_collection_type(self, items, locals, "vector"),
-            Expr::Tuple(items) => Ty::Tuple(
+            Expr::Tuple(items) => Ty::tuple(
                 items
                     .iter()
                     .map(|item| self.infer_expr(item, locals))
                     .collect(),
             ),
-            Expr::Error(_) => Ty::Unknown,
+            Expr::Error(_) => Ty::unknown(),
         };
         self.record_expr_type(expr.1, &ty);
         ty
     }
 
     fn concat_operand_info(&self, ty: &Ty) -> Option<ConcatOperandInfo> {
-        match ty {
-            Ty::Text(text) if text == "bit" => Some(ConcatOperandInfo {
+        match ty.kind() {
+            TyData::Text(text) if text == "bit" => Some(ConcatOperandInfo {
                 width: "1".to_string(),
-                elem: Ty::Text("bit".to_string()),
+                elem: Ty::text("bit".to_string()),
                 is_vector: false,
             }),
-            Ty::App { name, .. } if name == "bits" => Some(ConcatOperandInfo {
+            TyData::App { name, .. } if name == "bits" => Some(ConcatOperandInfo {
                 width: self.collection_length_text(ty)?,
-                elem: Ty::Text("bit".to_string()),
+                elem: Ty::text("bit".to_string()),
                 is_vector: false,
             }),
-            Ty::App { name, .. } if name == "vector" => Some(ConcatOperandInfo {
+            TyData::App { name, .. } if name == "vector" => Some(ConcatOperandInfo {
                 width: self.collection_length_text(ty)?,
                 elem: self.collection_element_type(ty)?,
                 is_vector: true,
@@ -6862,24 +7390,24 @@ impl<'a> Checker<'a> {
 
     fn infer_concat_result_type(&mut self, span: Span, lhs_ty: &Ty, rhs_ty: &Ty) -> Ty {
         if lhs_ty.is_unknown() || rhs_ty.is_unknown() {
-            return Ty::Unknown;
+            return Ty::unknown();
         }
         // Cross-file type aliases (e.g. xlenbits, regidx) cannot be resolved
         // by the local checker. Skip the concat check for any type that isn't
         // explicitly bits(...) or vector(...).
         let is_definitely_concatenable = |t: &Ty| {
-            let text = t.text();
+            let text = t.display_text();
             text.starts_with("bits(") || text.starts_with("vector(")
         };
         let is_definitely_not_concatenable = |t: &Ty| {
-            let text = t.text();
+            let text = t.display_text();
             matches!(text.as_str(), "int" | "nat" | "bool" | "string" | "unit" | "real")
         };
         if !is_definitely_concatenable(lhs_ty) && !is_definitely_not_concatenable(lhs_ty) {
-            return Ty::Unknown;
+            return Ty::unknown();
         }
         if !is_definitely_concatenable(rhs_ty) && !is_definitely_not_concatenable(rhs_ty) {
-            return Ty::Unknown;
+            return Ty::unknown();
         }
 
         let Some(lhs) = self.concat_operand_info(lhs_ty) else {
@@ -6888,10 +7416,10 @@ impl<'a> Checker<'a> {
                 span,
                 TypeError::other(format!(
                     "Cannot concatenate non-vector type {}",
-                    lhs_ty.text()
+                    lhs_ty.display_text()
                 )),
             );
-            return Ty::Unknown;
+            return Ty::unknown();
         };
         let Some(rhs) = self.concat_operand_info(rhs_ty) else {
             self.push_error(
@@ -6899,10 +7427,10 @@ impl<'a> Checker<'a> {
                 span,
                 TypeError::other(format!(
                     "Cannot concatenate non-vector type {}",
-                    rhs_ty.text()
+                    rhs_ty.display_text()
                 )),
             );
-            return Ty::Unknown;
+            return Ty::unknown();
         };
 
         let mut subst = Subst::default();
@@ -6912,11 +7440,11 @@ impl<'a> Checker<'a> {
                 span,
                 TypeError::other(format!(
                     "Cannot concatenate {} with {}",
-                    lhs_ty.text(),
-                    rhs_ty.text()
+                    lhs_ty.display_text(),
+                    rhs_ty.display_text()
                 )),
             );
-            return Ty::Unknown;
+            return Ty::unknown();
         }
 
         let elem_ty = apply_subst(&lhs.elem, &subst);
@@ -6949,8 +7477,8 @@ impl<'a> Checker<'a> {
                     _ => values.push(self.infer_expr(expr, locals)),
                 },
                 Frame::Reduce(span) => {
-                    let rhs_ty = values.pop().unwrap_or(Ty::Unknown);
-                    let lhs_ty = values.pop().unwrap_or(Ty::Unknown);
+                    let rhs_ty = values.pop().unwrap_or(Ty::unknown());
+                    let lhs_ty = values.pop().unwrap_or(Ty::unknown());
                     let ty = self.infer_concat_result_type(span, &lhs_ty, &rhs_ty);
                     self.record_expr_type(span, &ty);
                     values.push(ty);
@@ -6958,7 +7486,7 @@ impl<'a> Checker<'a> {
             }
         }
 
-        values.pop().unwrap_or(Ty::Unknown)
+        values.pop().unwrap_or(Ty::unknown())
     }
 
     fn infer_infix(
@@ -6979,19 +7507,19 @@ impl<'a> Checker<'a> {
             "&&" | "||" => {
                 for (side_ty, side_span) in [(&lhs_ty, lhs.1), (&rhs_ty, rhs.1)] {
                     let mut subst = Subst::default();
-                    if !unify(&Ty::Text("bool".to_string()), side_ty, &mut subst) {
+                    if !unify(&Ty::text("bool".to_string()), side_ty, &mut subst) {
                         self.push_error(
                             DiagnosticCode::TypeError,
                             side_span,
                             TypeError::Subtype {
-                                lhs: side_ty.text(),
+                                lhs: side_ty.display_text(),
                                 rhs: "bool".to_string(),
                                 constraint: None,
                             },
                         );
                     }
                 }
-                Ty::Text("bool".to_string())
+                Ty::text("bool".to_string())
             }
             "==" | "!=" | "<" | ">" | "<=" | ">="
             | "<_u" | ">_u" | "<=_u" | ">=_u"
@@ -7004,8 +7532,8 @@ impl<'a> Checker<'a> {
                 // can't fully resolve — Sail allows comparing bit-encodings
                 // against named types (e.g. `pmpAddrMatchType_encdec(x) == TOR`
                 // where the encoder returns `bits(2)` and TOR is an enum).
-                let lhs_text = lhs_ty.text();
-                let rhs_text = rhs_ty.text();
+                let lhs_text = lhs_ty.display_text();
+                let rhs_text = rhs_ty.display_text();
                 let primitives = [
                     "int", "nat", "bool", "string", "unit", "real", "bit", "_",
                 ];
@@ -7018,28 +7546,28 @@ impl<'a> Checker<'a> {
                         || text.starts_with("atom(")
                         || text.starts_with("int(")
                         || text.starts_with("nat(")
-                        || matches!(ty, Ty::Tuple(_) | Ty::App { .. })
+                        || matches!(ty.kind(), TyData::Tuple(_) | TyData::App { .. })
                 };
                 let has_polymorphism = lhs_text.contains('\'')
                     || rhs_text.contains('\'')
-                    || matches!(lhs_ty, Ty::Unknown)
-                    || matches!(rhs_ty, Ty::Unknown)
-                    || (matches!(lhs_ty, Ty::Text(_))
+                    || lhs_ty.is_unknown()
+                    || rhs_ty.is_unknown()
+                    || (matches!(lhs_ty.kind(), TyData::Text(_))
                         && !is_primitive_or_collection(&lhs_ty, &lhs_text))
-                    || (matches!(rhs_ty, Ty::Text(_))
+                    || (matches!(rhs_ty.kind(), TyData::Text(_))
                         && !is_primitive_or_collection(&rhs_ty, &rhs_text));
                 if !has_polymorphism && !unify(&lhs_ty, &rhs_ty, &mut subst) {
                     self.push_error(
                         DiagnosticCode::TypeError,
                         expr.1,
                         TypeError::Subtype {
-                            lhs: rhs_ty.text(),
-                            rhs: lhs_ty.text(),
+                            lhs: rhs_ty.display_text(),
+                            rhs: lhs_ty.display_text(),
                             constraint: None,
                         },
                     );
                 }
-                Ty::Text("bool".to_string())
+                Ty::text("bool".to_string())
             }
             "&" | "|" | "^" => {
                 // In Sail `&`, `|`, `^` are heavily overloaded across bool,
@@ -7047,18 +7575,18 @@ impl<'a> Checker<'a> {
                 // we can't reliably pick the result type. Return bool when
                 // both operands are clearly bool, otherwise return Unknown
                 // to avoid false positives in assert / if conditions.
-                let lhs_text = lhs_ty.text();
-                let rhs_text = rhs_ty.text();
+                let lhs_text = lhs_ty.display_text();
+                let rhs_text = rhs_ty.display_text();
                 if lhs_text == "bool" && rhs_text == "bool" {
-                    Ty::Text("bool".to_string())
+                    Ty::text("bool".to_string())
                 } else {
-                    Ty::Unknown
+                    Ty::unknown()
                 }
             }
             "<<" | ">>" | "<<<" | ">>>" => {
                 // Shift operators preserve the lhs type when known.
-                if matches!(lhs_ty, Ty::Unknown) {
-                    Ty::Unknown
+                if lhs_ty.is_unknown() {
+                    Ty::unknown()
                 } else {
                     lhs_ty
                 }
@@ -7072,28 +7600,28 @@ impl<'a> Checker<'a> {
                 // operands.
                 let lhs_resolved = self.env.resolve_alias(&lhs_ty);
                 let rhs_resolved = self.env.resolve_alias(&rhs_ty);
-                let lhs_text = lhs_resolved.text();
-                let rhs_text = rhs_resolved.text();
+                let lhs_text = lhs_resolved.display_text();
+                let rhs_text = rhs_resolved.display_text();
                 let is_bits = |t: &str| t.starts_with("bits(");
                 if is_bits(&lhs_text) {
                     lhs_ty
                 } else if is_bits(&rhs_text) {
                     rhs_ty
                 } else if lhs_text == "real" || rhs_text == "real" {
-                    Ty::Text("real".to_string())
-                } else if matches!(lhs_ty, Ty::Unknown) && matches!(rhs_ty, Ty::Unknown) {
-                    Ty::Unknown
-                } else if matches!(lhs_ty, Ty::Unknown) {
+                    Ty::text("real".to_string())
+                } else if lhs_ty.is_unknown() && rhs_ty.is_unknown() {
+                    Ty::unknown()
+                } else if lhs_ty.is_unknown() {
                     // One side known, the other unknown — return the known
                     // side (which may be a custom type alias).
                     rhs_ty
-                } else if matches!(rhs_ty, Ty::Unknown) {
+                } else if rhs_ty.is_unknown() {
                     lhs_ty
                 } else {
-                    Ty::Text("int".to_string())
+                    Ty::text("int".to_string())
                 }
             }
-            _ => Ty::Unknown,
+            _ => Ty::unknown(),
         }
     }
 
@@ -7110,12 +7638,12 @@ impl<'a> Checker<'a> {
             if let Some(guard) = &case.0.guard {
                 let guard_ty = self.infer_expr(guard, locals);
                 let mut subst = Subst::default();
-                if !unify(&Ty::Text("bool".to_string()), &guard_ty, &mut subst) {
+                if !unify(&Ty::text("bool".to_string()), &guard_ty, &mut subst) {
                     self.push_error(
                         DiagnosticCode::TypeError,
                         guard.1,
                         TypeError::Subtype {
-                            lhs: guard_ty.text(),
+                            lhs: guard_ty.display_text(),
                             rhs: "bool".to_string(),
                             constraint: None,
                         },
@@ -7130,11 +7658,11 @@ impl<'a> Checker<'a> {
                 Some(prev_ty) => {
                     // Skip if either side is Unknown — the case may call a
                     // cross-file function or be `exit()` which has unknown type.
-                    if matches!(prev_ty, Ty::Unknown) {
+                    if prev_ty.is_unknown() {
                         case_ty = Some(body_ty);
                         continue;
                     }
-                    if matches!(body_ty, Ty::Unknown) {
+                    if body_ty.is_unknown() {
                         continue;
                     }
                     let mut subst = Subst::default();
@@ -7143,8 +7671,8 @@ impl<'a> Checker<'a> {
                             DiagnosticCode::TypeError,
                             case.0.body.1,
                             TypeError::Subtype {
-                                lhs: body_ty.text(),
-                                rhs: prev_ty.text(),
+                                lhs: body_ty.display_text(),
+                                rhs: prev_ty.display_text(),
                                 constraint: None,
                             },
                         );
@@ -7152,7 +7680,7 @@ impl<'a> Checker<'a> {
                 }
             }
         }
-        case_ty.unwrap_or(Ty::Unknown)
+        case_ty.unwrap_or(Ty::unknown())
     }
 
     fn check_match_cases(
@@ -7162,25 +7690,134 @@ impl<'a> Checker<'a> {
         expected: &Ty,
         locals: &mut LocalEnv,
     ) -> Ty {
+
         for case in cases {
             locals.push_scope();
             self.bind_pattern(&case.0.pattern, Some(scrutinee_ty.clone()), locals);
             if let Some(guard) = &case.0.guard {
                 let guard_ty = self.infer_expr(guard, locals);
-                self.expect_type(guard.1, &guard_ty, &Ty::Text("bool".to_string()));
+                self.expect_type(guard.1, &guard_ty, &Ty::text("bool".to_string()));
                 self.add_expr_constraint(locals, guard, true);
             }
             self.check_expr(&case.0.body, expected, locals);
             locals.pop_scope();
         }
+        self.check_match_exhaustiveness(&scrutinee_ty, cases);
         expected.clone()
+    }
+
+    /// Run the Maranget-style pattern usefulness check on a `match` and
+    /// emit `IncompleteMatch` / `RedundantMatchArm` diagnostics. Pattern
+    /// binding has already happened in `check_match_cases`.
+    fn check_match_exhaustiveness(
+        &mut self,
+        scrutinee_ty: &Ty,
+        cases: &[Spanned<MatchCase>],
+    ) {
+        if cases.is_empty() {
+            return;
+        }
+        // Lower scrutinee type into the algorithm's MatchTy. We use the
+        // resolved alias so cross-file `xlenbits = bits(64)` etc. don't
+        // confuse the constructor lookup.
+        let resolved = self.env.resolve_alias(scrutinee_ty);
+        let scrutinee_match_ty = ty_to_match_ty(&resolved);
+
+        // Lower the cases.
+        let pattern_constants = &self.pattern_constants;
+        let has_workspace = self.env.has_workspace_context;
+        let lookup = |name: &str| -> bool {
+            is_pattern_binding(name, pattern_constants, has_workspace)
+        };
+        // is_pattern_binding returns true for *binding-y* names. We need
+        // the inverse — names that ARE constants.
+        let is_constant = |name: &str| -> bool { !lookup(name) };
+        let arms = match_check::lower_arms(cases, &is_constant);
+
+        // Build a per-call constructor arity table from local + cross-file
+        // constructor schemes. Empty schemes (no params) → arity 0.
+        let mut arity_map: HashMap<String, usize> = HashMap::new();
+        for (name, schemes) in &self.env.constructors {
+            if let Some(scheme) = schemes.first() {
+                let arity = match scheme.params.as_slice() {
+                    [] => 0,
+                    [single] => match single.kind() {
+                        TyData::Tuple(items) => items.len(),
+                        _ => 1,
+                    },
+                    many => many.len(),
+                };
+                arity_map.insert(name.clone(), arity);
+            }
+        }
+        // Cross-file callable arities are recorded as `(min, max)` pairs
+        // (Sail union variants accept both flattened and tuple forms).
+        // The matrix algorithm wants a single arity per constructor, so
+        // we take the larger value — that's the form most patterns use
+        // when destructuring.
+        for (name, arities) in &self.env.cross_file_function_arity {
+            if arity_map.contains_key(name) {
+                continue;
+            }
+            if let Some(&(_, max)) = arities.iter().max_by_key(|(_, max)| *max) {
+                arity_map.insert(name.clone(), max);
+            }
+        }
+
+        let cx = EnvCx {
+            enums: &self.env.enums,
+            unions: &self.env.unions,
+            constructor_arity: &arity_map,
+        };
+        let report = match_check::compute_match_usefulness(&arms, &scrutinee_match_ty, &cx);
+
+        // Only report when we can name a concrete missing constructor.
+        // A witness of just `_` happens whenever the scrutinee type is
+        // Unknown (we couldn't classify it) or Unlistable (numeric /
+        // string literal universe with no wildcard arm). Either case
+        // would generate noise: the former because we don't actually
+        // know what's missing, the latter because Sail style commonly
+        // uses literal-only matches on int and the user knows the call
+        // sites are exhaustive.
+        let has_concrete_witness = report
+            .missing_witnesses
+            .iter()
+            .any(|w| !matches!(w, match_check::MatchPat::Wild));
+        if has_concrete_witness {
+            let anchor_span = cases[0].1;
+            let range = tower_lsp::lsp_types::Range::new(
+                self.file.source.position_at(anchor_span.start),
+                self.file
+                    .source
+                    .position_at((anchor_span.start + 1).min(anchor_span.end)),
+            );
+            let missing = report
+                .missing_witnesses
+                .iter()
+                .filter(|w| !matches!(w, match_check::MatchPat::Wild))
+                .map(|w| w.display_text())
+                .collect::<Vec<_>>()
+                .join(", ");
+            self.diagnostics.push(Diagnostic::new(
+                DiagnosticCode::IncompleteMatch,
+                format!("Non-exhaustive match: missing arm(s) for {missing}"),
+                range,
+                Severity::Warning,
+            ));
+        }
+        // Redundancy reporting is intentionally disabled in this MVP.
+        // The matrix algorithm sees `pma :: rest` and `[||]` as two
+        // wildcards (we don't model list/struct/vector patterns yet), so
+        // the second one looks redundant when it isn't. We'll re-enable
+        // this once those pattern shapes are lowered properly.
+        let _ = report.redundant;
     }
 
     fn mapping_call_arg_type(&self, arg_types: &[Ty]) -> Ty {
         match arg_types {
-            [] => Ty::Text("unit".to_string()),
+            [] => Ty::text("unit".to_string()),
             [arg] => arg.clone(),
-            _ => Ty::Tuple(arg_types.to_vec()),
+            _ => Ty::tuple(arg_types.to_vec()),
         }
     }
 
@@ -7200,6 +7837,7 @@ impl<'a> Checker<'a> {
         let actual_arg = self.mapping_call_arg_type(arg_types);
         let mut errors = Vec::new();
         for mapping in mappings {
+            let sig = format_mapping_signature(mapping.as_ref());
             let mut forwards_subst = Subst::default();
             if unify(&mapping.lhs, &actual_arg, &mut forwards_subst) {
                 let forwards_ret = apply_subst(&mapping.rhs, &forwards_subst);
@@ -7209,28 +7847,30 @@ impl<'a> Checker<'a> {
                             format!("{callee_name}_forwards"),
                             span,
                             Box::new(TypeError::Subtype {
-                                lhs: forwards_ret.text(),
-                                rhs: expected_ret.text(),
+                                lhs: forwards_ret.display_text(),
+                                rhs: expected_ret.display_text(),
                                 constraint: None,
                             }),
                         ));
-                    } else if let Some(error) = self.instantiation_error(
+                    } else if let Some(error) = self.instantiation_error_with_sig(
                         callee_name,
                         &mapping.quantifiers,
                         &mapping.constraints,
                         &forwards_subst,
                         assumptions,
+                        Some(sig.clone()),
                     ) {
                         errors.push((format!("{callee_name}_forwards"), span, Box::new(error)));
                     } else {
                         return Some(apply_subst(&mapping.rhs, &forwards_subst));
                     }
-                } else if let Some(error) = self.instantiation_error(
+                } else if let Some(error) = self.instantiation_error_with_sig(
                     callee_name,
                     &mapping.quantifiers,
                     &mapping.constraints,
                     &forwards_subst,
                     assumptions,
+                    Some(sig.clone()),
                 ) {
                     errors.push((format!("{callee_name}_forwards"), span, Box::new(error)));
                 } else {
@@ -7241,8 +7881,8 @@ impl<'a> Checker<'a> {
                     format!("{callee_name}_forwards"),
                     span,
                     Box::new(TypeError::Subtype {
-                        lhs: actual_arg.text(),
-                        rhs: mapping.lhs.text(),
+                        lhs: actual_arg.display_text(),
+                        rhs: mapping.lhs.display_text(),
                         constraint: None,
                     }),
                 ));
@@ -7257,28 +7897,30 @@ impl<'a> Checker<'a> {
                             format!("{callee_name}_backwards"),
                             span,
                             Box::new(TypeError::Subtype {
-                                lhs: backwards_ret.text(),
-                                rhs: expected_ret.text(),
+                                lhs: backwards_ret.display_text(),
+                                rhs: expected_ret.display_text(),
                                 constraint: None,
                             }),
                         ));
-                    } else if let Some(error) = self.instantiation_error(
+                    } else if let Some(error) = self.instantiation_error_with_sig(
                         callee_name,
                         &mapping.quantifiers,
                         &mapping.constraints,
                         &backwards_subst,
                         assumptions,
+                        Some(sig.clone()),
                     ) {
                         errors.push((format!("{callee_name}_backwards"), span, Box::new(error)));
                     } else {
                         return Some(apply_subst(&mapping.lhs, &backwards_subst));
                     }
-                } else if let Some(error) = self.instantiation_error(
+                } else if let Some(error) = self.instantiation_error_with_sig(
                     callee_name,
                     &mapping.quantifiers,
                     &mapping.constraints,
                     &backwards_subst,
                     assumptions,
+                    Some(sig),
                 ) {
                     errors.push((format!("{callee_name}_backwards"), span, Box::new(error)));
                 } else {
@@ -7289,8 +7931,8 @@ impl<'a> Checker<'a> {
                     format!("{callee_name}_backwards"),
                     span,
                     Box::new(TypeError::Subtype {
-                        lhs: actual_arg.text(),
-                        rhs: mapping.rhs.text(),
+                        lhs: actual_arg.display_text(),
+                        rhs: mapping.rhs.display_text(),
                         constraint: None,
                     }),
                 ));
@@ -7305,7 +7947,7 @@ impl<'a> Checker<'a> {
                 errors,
             },
         );
-        Some(Ty::Unknown)
+        Some(Ty::unknown())
     }
 
     fn check_mapping_body(
@@ -7367,7 +8009,7 @@ impl<'a> Checker<'a> {
                     locals.push_scope();
                     self.define_captured_bindings(locals, &shared_bindings);
                     let guard_ty = self.infer_expr(guard, locals);
-                    self.expect_type(guard.1, &guard_ty, &Ty::Text("bool".to_string()));
+                    self.expect_type(guard.1, &guard_ty, &Ty::text("bool".to_string()));
                     self.add_expr_constraint(locals, guard, true);
                     locals.restore(guard_mark);
                 }
@@ -7383,7 +8025,7 @@ impl<'a> Checker<'a> {
             }
             if let Some(guard) = &arm.0.guard {
                 let guard_ty = self.infer_expr(guard, locals);
-                self.expect_type(guard.1, &guard_ty, &Ty::Text("bool".to_string()));
+                self.expect_type(guard.1, &guard_ty, &Ty::text("bool".to_string()));
                 self.add_expr_constraint(locals, guard, true);
             }
             if let Some(pattern) = &arm.0.rhs_pattern {
@@ -7396,7 +8038,7 @@ impl<'a> Checker<'a> {
     }
 
     fn check_mapping_definition(&mut self, def: &sail_parser::core_ast::CallableDefinition) {
-        let scheme = self
+        let scheme: Option<Arc<MappingScheme>> = self
             .env
             .mappings
             .get(&def.name.0)
@@ -7405,6 +8047,7 @@ impl<'a> Checker<'a> {
                 def.signature
                     .as_ref()
                     .and_then(|signature| mapping_from_type_expr(self.source, signature))
+                    .map(Arc::new)
             });
         let Some(scheme) = scheme else {
             return;
@@ -7440,7 +8083,7 @@ impl<'a> Checker<'a> {
             _ => {
                 let Some(name) = expr_symbol(&call.callee) else {
                     self.infer_expr(&call.callee, locals);
-                    return Ty::Unknown;
+                    return Ty::unknown();
                 };
                 name.to_string()
             }
@@ -7484,25 +8127,73 @@ impl<'a> Checker<'a> {
         }
         let candidates = self.env.lookup_functions(&callee_name);
 
-        if candidates.is_empty() {
-            // The local type-check environment only knows about same-file
-            // functions and built-in primops. Cross-file callees (which are the
-            // norm in projects like sail-riscv) and union/enum constructors
-            // (None, Some, X, etc.) won't appear here. Silently return Unknown
-            // instead of producing a "Function not found" error to avoid
-            // thousands of false positives — the upstream Sail compiler uses a
-            // global type environment, which we don't have at single-file scope.
-            return Ty::Unknown;
+        // Cross-file arity check (B1, narrow scope). Even when we have
+        // no LOCAL candidates AND we'd otherwise bail, we can still use
+        // the cached cross-file arity table to catch obvious wrong-arg-
+        // count bugs. We do this BEFORE the candidates.is_empty() bail
+        // so it covers cross-file calls in files that don't define the
+        // function locally.
+        let cross_file_known = self.env.cross_file_function_names.contains(&callee_name)
+            || self.env.cross_file_constructor_names.contains(&callee_name);
+        if cross_file_known {
+            let mut arities: SmallVec<[(usize, usize); 8]> = SmallVec::new();
+            for c in &candidates {
+                let total = c.params.len();
+                let required = c
+                    .implicit_params
+                    .iter()
+                    .filter(|implicit| !**implicit)
+                    .count();
+                arities.push((required, total));
+            }
+            if let Some(extra) = self.env.cross_file_function_arity.get(&callee_name) {
+                arities.extend(extra.iter().copied());
+            }
+            let arg_count = arg_types.len();
+            let lexp_offset = if self.in_lexp_call { 1usize } else { 0 };
+            // Accept the call when any known overload's arity matches.
+            // In lvalue context (`wX(idx) = data`), Sail's setter
+            // desugaring removes the value arg, so the call site has
+            // one fewer arg than the underlying signature — accept
+            // `arg_count + 1` as well, but only there.
+            let any_match = arities.iter().any(|(req, total)| {
+                let lexp_candidate = arg_count + lexp_offset;
+                (arg_count >= *req && arg_count <= *total)
+                    || (lexp_candidate >= *req && lexp_candidate <= *total)
+            });
+            if !arities.is_empty() && !any_match {
+                let (min_req, max_total) = arities.iter().fold(
+                    (usize::MAX, 0usize),
+                    |(min_req, max_total), (req, total)| {
+                        (min_req.min(*req), max_total.max(*total))
+                    },
+                );
+                self.push_error(
+                    DiagnosticCode::MismatchedArgCount,
+                    call.callee.1,
+                    TypeError::other(if min_req == max_total {
+                        format!("Expected {} arguments, found {}", max_total, arg_count)
+                    } else {
+                        format!(
+                            "Expected {}-{} arguments, found {}",
+                            min_req, max_total, arg_count
+                        )
+                    }),
+                );
+            }
+            // Cross-file callee — don't try the local candidate
+            // matching path; we just return Unknown and let upstream
+            // diagnostics carry the day.
+            return Ty::unknown();
         }
 
-        // If this name also exists in cross-file workspace data, skip the
-        // candidate-matching step entirely. We can't reliably check arity or
-        // unify args because there may be additional overload variants we
-        // haven't merged. Return Unknown.
-        if self.env.cross_file_function_names.contains(&callee_name)
-            || self.env.cross_file_constructor_names.contains(&callee_name)
-        {
-            return Ty::Unknown;
+        if candidates.is_empty() {
+            // No scheme available — could be a built-in primop, a Sail
+            // standard-library function we don't parse, or a cross-file
+            // callable that lacks a `val` declaration. Stay silent —
+            // the strict unresolved-identifier check catches the truly
+            // unknown case via `Expr::Ident`.
+            return Ty::unknown();
         }
 
         let mut count_mismatch: Option<(usize, usize)> = None;
@@ -7560,10 +8251,10 @@ impl<'a> Checker<'a> {
                         arg_spans[index],
                         Box::new(TypeError::FunctionArg {
                             span: arg_spans[index],
-                            ty: expected.text(),
+                            ty: expected.display_text(),
                             error: Box::new(TypeError::Subtype {
-                                lhs: actual.text(),
-                                rhs: expected.text(),
+                                lhs: actual.display_text(),
+                                rhs: expected.display_text(),
                                 constraint: None,
                             }),
                         }),
@@ -7579,20 +8270,21 @@ impl<'a> Checker<'a> {
                             callee_name.clone(),
                             call.callee.1,
                             Box::new(TypeError::Subtype {
-                                lhs: ret.text(),
-                                rhs: expected_ret.text(),
+                                lhs: ret.display_text(),
+                                rhs: expected_ret.display_text(),
                                 constraint: None,
                             }),
                         ));
                         continue;
                     }
                 }
-                if let Some(error) = self.instantiation_error(
+                if let Some(error) = self.instantiation_error_with_sig(
                     &callee_name,
                     &candidate.quantifiers,
                     &candidate.constraints,
                     &subst,
                     &assumptions,
+                    Some(format_scheme_signature(candidate.as_ref())),
                 ) {
                     candidate_errors.push((callee_name.clone(), call.callee.1, Box::new(error)));
                     continue;
@@ -7601,23 +8293,28 @@ impl<'a> Checker<'a> {
             }
         }
 
-        // For overloaded functions, some variants may live in other files and
-        // not be present in the local env. If the call name is registered as an
-        // overload, we cannot reliably determine arg count mismatch from only
-        // the local candidates — suppress the warning to avoid false positives.
+        // For overloaded functions, some variants may live in other files
+        // and lack a `val` declaration so we never built a scheme for them.
+        // If the call name is registered as an overload AND at least one
+        // member has no scheme in the env, we can't reliably determine
+        // arg-count mismatch — stay silent to avoid false positives.
         let is_partial_overload = self
             .env
             .overloads
             .get(&callee_name)
-            .map(|members| members.len() > 0)
+            .map(|members| {
+                members
+                    .iter()
+                    .any(|m| !self.env.functions.contains_key(m))
+            })
             .unwrap_or(false);
 
         // If any argument type is Unknown (typically from a cross-file call),
         // we can't reliably check overload resolution or quantifier
         // instantiation — suppress candidate errors to avoid false positives.
-        let has_unknown_arg = arg_types.iter().any(|t| matches!(t, Ty::Unknown));
+        let has_unknown_arg = arg_types.iter().any(|t| t.is_unknown());
         if has_unknown_arg {
-            return Ty::Unknown;
+            return Ty::unknown();
         }
 
         if let Some((expected, actual)) = count_mismatch {
@@ -7647,7 +8344,7 @@ impl<'a> Checker<'a> {
                 },
             );
         }
-        Ty::Unknown
+        Ty::unknown()
     }
 }
 
@@ -7663,25 +8360,23 @@ fn infer_collection_type(
         if let Some(prev) = &item_ty {
             let mut subst = Subst::default();
             if !unify(prev, &ty, &mut subst) {
-                return Ty::Unknown;
+                return Ty::unknown();
             }
         } else {
             item_ty = Some(ty);
         }
     }
-    let elem = item_ty.unwrap_or(Ty::Unknown);
+    let elem = item_ty.unwrap_or(Ty::unknown());
     match name {
         "vector" => vector_ty(items.len(), elem),
-        "list" => Ty::App {
-            name: name.to_string(),
-            args: vec![TyArg::Type(Box::new(elem.clone()))],
-            text: format!("{name}({})", elem.text()),
-        },
-        _ => Ty::App {
-            name: name.to_string(),
-            args: vec![TyArg::Type(Box::new(elem.clone()))],
-            text: format!("{name}({})", elem.text()),
-        },
+        "list" => {
+            let text = format!("{name}({})", elem.display_text());
+            Ty::app(name, vec![TyArg::Type(elem)], text)
+        }
+        _ => {
+            let text = format!("{name}({})", elem.display_text());
+            Ty::app(name, vec![TyArg::Type(elem)], text)
+        }
     }
 }
 
@@ -7733,6 +8428,412 @@ pub(crate) fn check_file(file: &File) -> Option<TypeCheckResult> {
     Some(Checker::new(file, env, pattern_constants).check_source_file(ast))
 }
 
+/// Cross-file aggregation result. Computed once per workspace fingerprint
+/// and shared between every `check_file_with_workspace` call that sees the
+/// same set of file content hashes. Without this cache, every per-file
+/// typecheck would walk every workspace file's `core_ast.defs` from
+/// scratch — O(N²) per workspace recompute pass.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct WorkspaceContext {
+    type_aliases: HashMap<String, Ty>,
+    overloads: HashMap<String, Vec<String>>,
+    known_field_names: HashSet<String>,
+    cross_file_function_names: HashSet<String>,
+    cross_file_constructor_names: HashSet<String>,
+    cross_file_value_names: HashSet<String>,
+    cross_file_register_names: HashSet<String>,
+    /// Pattern constants contributed by cross-file enums/unions/scattered
+    /// enum clauses. Merged into the per-file `pattern_constants` set
+    /// during typechecking.
+    cross_file_pattern_constants: HashSet<String>,
+    /// Function schemes from `val f : ...` declarations in other files,
+    /// merged into the local env by `apply_to` so `infer_call` can do
+    /// real arity / argument-type checking on cross-file calls.
+    cross_file_function_schemes: HashMap<String, Vec<Arc<TypeScheme>>>,
+    /// Constructor schemes from union variants in other files, used by
+    /// the same path so `Some(x, y)` calling a single-arg constructor
+    /// gets a real arity-mismatch diagnostic instead of silence.
+    cross_file_constructor_schemes: HashMap<String, Vec<Arc<TypeScheme>>>,
+    /// Type-name → enum member list, aggregated across all workspace
+    /// files. The pattern-exhaustiveness check uses this to enumerate
+    /// constructors for cross-file enum types so it can report missing
+    /// arms even when the enum is defined in a different file.
+    enums: HashMap<String, Vec<String>>,
+    /// Type-name → union variant list, aggregated across all workspace
+    /// files. Same role as `enums` but for union types.
+    unions: HashMap<String, Vec<String>>,
+}
+
+impl WorkspaceContext {
+    fn build<'a>(files: impl IntoIterator<Item = &'a File>) -> Self {
+        let mut ctx = WorkspaceContext::default();
+        for f in files {
+            let Some(other_ast) = f.core_ast() else { continue };
+            let other_source = f.source.text();
+            for (item, _) in &other_ast.defs {
+                match &item.kind {
+                    DefinitionKind::TypeAlias(def) => {
+                        if let Some(target) = &def.target {
+                            let underlying = type_from_type_expr(other_source, target);
+                            ctx.type_aliases
+                                .entry(def.name.0.clone())
+                                .or_insert(underlying);
+                        }
+                    }
+                    DefinitionKind::CallableSpec(spec) => {
+                        ctx.cross_file_function_names.insert(spec.name.0.clone());
+                        // Only `val ... -> ...` specs are reliable enough to
+                        // share across files. We skip `mapping` specs here
+                        // since mapping schemes have a different shape that
+                        // the call-site checker doesn't yet understand
+                        // bidirectionally.
+                        if !matches!(spec.kind, sail_parser::CallableSpecKind::Mapping) {
+                            let scheme =
+                                Arc::new(scheme_from_type_expr(other_source, &spec.signature));
+                            ctx.cross_file_function_schemes
+                                .entry(spec.name.0.clone())
+                                .or_default()
+                                .push(scheme);
+                        }
+                    }
+                    DefinitionKind::Callable(def) => {
+                        ctx.cross_file_function_names.insert(def.name.0.clone());
+                    }
+                    DefinitionKind::Named(def) => match def.kind {
+                        NamedDefKind::Enum => {
+                            let entry = ctx.enums.entry(def.name.0.clone()).or_default();
+                            for member in &def.members {
+                                ctx.cross_file_pattern_constants.insert(member.0.clone());
+                                ctx.cross_file_value_names.insert(member.0.clone());
+                                if !entry.contains(&member.0) {
+                                    entry.push(member.0.clone());
+                                }
+                            }
+                            if let Some(NamedDefDetail::Enum { members, .. }) = &def.detail {
+                                for m in members {
+                                    ctx.cross_file_pattern_constants
+                                        .insert(m.0.name.0.clone());
+                                    ctx.cross_file_value_names.insert(m.0.name.0.clone());
+                                    if !entry.contains(&m.0.name.0) {
+                                        entry.push(m.0.name.0.clone());
+                                    }
+                                }
+                            }
+                        }
+                        NamedDefKind::Union => {
+                            if let Some(NamedDefDetail::Union { variants }) = &def.detail {
+                                let entry =
+                                    ctx.unions.entry(def.name.0.clone()).or_default();
+                                for v in variants {
+                                    if !entry.contains(&v.0.name.0) {
+                                        entry.push(v.0.name.0.clone());
+                                    }
+                                }
+                            }
+                            if let Some(NamedDefDetail::Union { variants }) = &def.detail {
+                                for v in variants {
+                                    ctx.cross_file_constructor_names
+                                        .insert(v.0.name.0.clone());
+                                    // Build a real scheme from the variant
+                                    // signature so cross-file `Some(x)` etc.
+                                    // can be arity / arg-type checked.
+                                    let scheme =
+                                        scheme_from_union_variant(other_source, def, &v.0);
+                                    ctx.cross_file_constructor_schemes
+                                        .entry(v.0.name.0.clone())
+                                        .or_default()
+                                        .push(Arc::new(scheme));
+                                }
+                            }
+                        }
+                        NamedDefKind::Register => {
+                            ctx.cross_file_register_names.insert(def.name.0.clone());
+                            ctx.cross_file_value_names.insert(def.name.0.clone());
+                        }
+                        NamedDefKind::Let | NamedDefKind::Var => {
+                            ctx.cross_file_value_names.insert(def.name.0.clone());
+                        }
+                        NamedDefKind::Struct => {
+                            if let Some(NamedDefDetail::Struct { fields }) = &def.detail {
+                                for field in fields {
+                                    ctx.known_field_names.insert(field.0.name.0.clone());
+                                }
+                            }
+                        }
+                        NamedDefKind::Bitfield => {
+                            if let Some(NamedDefDetail::Bitfield { fields }) = &def.detail {
+                                for field in fields {
+                                    ctx.known_field_names.insert(field.0.name.0.clone());
+                                }
+                            }
+                        }
+                        NamedDefKind::Overload => {
+                            let entry = ctx.overloads.entry(def.name.0.clone()).or_default();
+                            for m in &def.members {
+                                if !entry.contains(&m.0) {
+                                    entry.push(m.0.clone());
+                                }
+                            }
+                            ctx.cross_file_function_names.insert(def.name.0.clone());
+                        }
+                        _ => {}
+                    },
+                    DefinitionKind::ScatteredClause(def)
+                        if matches!(def.kind, sail_parser::ScatteredClauseKind::Enum) =>
+                    {
+                        ctx.cross_file_pattern_constants
+                            .insert(def.member.0.clone());
+                        ctx.cross_file_value_names.insert(def.member.0.clone());
+                        let entry = ctx.enums.entry(def.name.0.clone()).or_default();
+                        if !entry.contains(&def.member.0) {
+                            entry.push(def.member.0.clone());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        ctx
+    }
+
+    /// Apply this cached aggregation to a freshly built per-file env.
+    /// Merges cross-file `val`-derived function schemes and union variant
+    /// constructor schemes into the local env so `infer_call` can do real
+    /// arity / argument-type checking on cross-file calls. The unifier
+    /// (with depth limit + chain compression in `apply_subst`) is now
+    /// safe against the recursion blow-ups that defeated the first try.
+    fn apply_to(&self, env: &mut TopLevelEnv, pattern_constants: &mut HashSet<String>) {
+        // Type aliases: merge but don't overwrite local definitions.
+        for (name, ty) in &self.type_aliases {
+            env.type_aliases
+                .entry(name.clone())
+                .or_insert_with(|| ty.clone());
+        }
+        // Overloads: union, preserving existing entries.
+        for (name, members) in &self.overloads {
+            let entry = env.overloads.entry(name.clone()).or_default();
+            for m in members {
+                if !entry.contains(m) {
+                    entry.push(m.clone());
+                }
+            }
+        }
+        // Known field names: union.
+        env.known_field_names
+            .extend(self.known_field_names.iter().cloned());
+        // Cross-file name sets: replace.
+        env.cross_file_function_names = self.cross_file_function_names.clone();
+        env.cross_file_constructor_names = self.cross_file_constructor_names.clone();
+        env.cross_file_value_names = self.cross_file_value_names.clone();
+        env.cross_file_register_names = self.cross_file_register_names.clone();
+        // Enums / unions: union with locally-defined entries.
+        for (name, members) in &self.enums {
+            let entry = env.enums.entry(name.clone()).or_default();
+            for m in members {
+                if !entry.contains(m) {
+                    entry.push(m.clone());
+                }
+            }
+        }
+        for (name, variants) in &self.unions {
+            let entry = env.unions.entry(name.clone()).or_default();
+            for v in variants {
+                if !entry.contains(v) {
+                    entry.push(v.clone());
+                }
+            }
+        }
+        // B1 (cross-file scheme merging) is intentionally NOT done via
+        // `env.functions`/`env.constructors`. Doing so causes the unifier
+        // to recurse pathologically when a cross-file scheme contains
+        // quantified `forall 'n` types — even with a unify depth limit,
+        // the recursion blow-up was reproducible on the sail-riscv
+        // corpus and ate the 64 MiB worker stack.
+        //
+        // Instead we expose the cross-file schemes via dedicated arity-
+        // check sets (see `cross_file_function_arity` /
+        // `cross_file_constructor_arity` below). The arity check is
+        // sound and safe — it only counts params, never invokes the
+        // unifier on a quantified type.
+        for (name, schemes) in &self.cross_file_function_schemes {
+            let arities: Vec<(usize, usize)> = schemes
+                .iter()
+                .flat_map(|s| {
+                    let total = s.params.len();
+                    let required = s
+                        .implicit_params
+                        .iter()
+                        .filter(|implicit| !**implicit)
+                        .count();
+                    let mut variants = vec![(required, total)];
+                    // Sail allows calling `(A, B) -> C` either with one
+                    // tuple arg or two flattened args. Accept both.
+                    if s.params.len() == 1 {
+                        if let TyData::Tuple(items) = s.params[0].kind() {
+                            variants.push((items.len(), items.len()));
+                        }
+                    }
+                    variants
+                })
+                .collect();
+            env.cross_file_function_arity
+                .entry(name.clone())
+                .or_default()
+                .extend(arities);
+        }
+        for (name, schemes) in &self.cross_file_constructor_schemes {
+            // Sail union variants are typically declared with a single
+            // tuple-typed param (e.g. `Step_Execute : (ExecutionResult,
+            // instbits)`), but the call site can pass either one tuple
+            // OR the flattened element list. Record BOTH arities so the
+            // check accepts either form.
+            let arities: Vec<(usize, usize)> = schemes
+                .iter()
+                .flat_map(|s| {
+                    let mut variants = vec![(s.params.len(), s.params.len())];
+                    if s.params.len() == 1 {
+                        if let TyData::Tuple(items) = s.params[0].kind() {
+                            variants.push((items.len(), items.len()));
+                        }
+                    }
+                    variants
+                })
+                .collect();
+            env.cross_file_function_arity
+                .entry(name.clone())
+                .or_default()
+                .extend(arities);
+        }
+        // Pattern constants: union with cross-file contributions.
+        pattern_constants.extend(self.cross_file_pattern_constants.iter().cloned());
+        pattern_constants.extend(self.cross_file_constructor_names.iter().cloned());
+    }
+}
+
+/// Process-global cache for the most recent `WorkspaceContext`. Keyed by
+/// a fingerprint over the participating files' content hashes (sorted to
+/// be order-independent). Workspace recompute storms (e.g. the
+/// "rerun every open file after the disk scan finished" pass) get a
+/// single aggregation pass instead of one per file.
+struct WorkspaceContextCache {
+    fingerprint: u64,
+    ctx: Arc<WorkspaceContext>,
+}
+
+static WORKSPACE_CONTEXT_CACHE: OnceLock<Mutex<Option<WorkspaceContextCache>>> = OnceLock::new();
+
+fn workspace_context_cache() -> &'static Mutex<Option<WorkspaceContextCache>> {
+    WORKSPACE_CONTEXT_CACHE.get_or_init(|| Mutex::new(None))
+}
+
+/// Per-file inference cache. Maps `(file content hash, workspace
+/// fingerprint)` → cached `TypeCheckResult`. The fingerprint guards
+/// against stale results when the workspace exports change; the file
+/// hash guards against stale results when the body changes.
+///
+/// This is the lightweight analogue of salsa's per-function `infer_query`
+/// memoization (rust-analyzer's `InferenceResult::for_body`). It pays off
+/// most when the worker re-runs typechecks for files that haven't
+/// actually changed (e.g. the post-scan "refresh all open files" pass,
+/// or reverse-dependency reschedules where the dependent file wasn't
+/// itself edited).
+///
+/// Bounded at 256 entries with FIFO eviction so a long-running session
+/// doesn't accumulate stale memory. Even at 256 sail-riscv files this
+/// fits comfortably in memory because each cached `TypeCheckResult` is
+/// already Arc-shared.
+struct InferenceCacheEntry {
+    file_hash: u64,
+    workspace_fp: u64,
+    workspace_complete: bool,
+    result: Arc<TypeCheckResult>,
+}
+
+const INFERENCE_CACHE_CAPACITY: usize = 256;
+
+static INFERENCE_CACHE: OnceLock<Mutex<Vec<InferenceCacheEntry>>> = OnceLock::new();
+
+fn inference_cache() -> &'static Mutex<Vec<InferenceCacheEntry>> {
+    INFERENCE_CACHE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn inference_cache_lookup(
+    file_hash: u64,
+    workspace_fp: u64,
+    workspace_complete: bool,
+) -> Option<Arc<TypeCheckResult>> {
+    let cache = inference_cache().lock().unwrap();
+    cache
+        .iter()
+        .rev()
+        .find(|e| {
+            e.file_hash == file_hash
+                && e.workspace_fp == workspace_fp
+                && e.workspace_complete == workspace_complete
+        })
+        .map(|e| e.result.clone())
+}
+
+fn inference_cache_store(
+    file_hash: u64,
+    workspace_fp: u64,
+    workspace_complete: bool,
+    result: Arc<TypeCheckResult>,
+) {
+    let mut cache = inference_cache().lock().unwrap();
+    // Evict any prior entry for the same file (different workspace fp or
+    // completeness flag) so the cache stays bounded under typical
+    // "user keeps editing one file" workloads.
+    cache.retain(|e| e.file_hash != file_hash);
+    cache.push(InferenceCacheEntry {
+        file_hash,
+        workspace_fp,
+        workspace_complete,
+        result,
+    });
+    if cache.len() > INFERENCE_CACHE_CAPACITY {
+        let drop_count = cache.len() - INFERENCE_CACHE_CAPACITY;
+        cache.drain(0..drop_count);
+    }
+}
+
+/// Order-independent fingerprint over the file content hashes. Two
+/// snapshots with the same set of files (regardless of iteration order)
+/// produce the same fingerprint.
+fn fingerprint_files<'a>(files: impl IntoIterator<Item = &'a File>) -> u64 {
+    let mut hashes: Vec<u64> = files.into_iter().map(|f| f.content_hash()).collect();
+    hashes.sort_unstable();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    hashes.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Look up — and on miss build + memoize — the cached `WorkspaceContext`
+/// for `files`. The cache holds a single slot, which is enough for the
+/// typical "one workspace per process" use case.
+fn cached_workspace_context<'a, I>(files: I) -> Arc<WorkspaceContext>
+where
+    I: IntoIterator<Item = &'a File> + Clone,
+{
+    let fp = fingerprint_files(files.clone());
+    let cell = workspace_context_cache();
+    {
+        let guard = cell.lock().unwrap();
+        if let Some(slot) = guard.as_ref() {
+            if slot.fingerprint == fp {
+                return slot.ctx.clone();
+            }
+        }
+    }
+    let ctx = Arc::new(WorkspaceContext::build(files));
+    let mut guard = cell.lock().unwrap();
+    *guard = Some(WorkspaceContextCache {
+        fingerprint: fp,
+        ctx: ctx.clone(),
+    });
+    ctx
+}
+
 /// Type-check a file with selective cross-file context. We deliberately
 /// merge ONLY data that is safe and unambiguous:
 ///   - Type aliases (so `xlenbits` resolves to `bits(64)`)
@@ -7751,124 +8852,68 @@ pub(crate) fn check_file(file: &File) -> Option<TypeCheckResult> {
 pub(crate) fn check_file_with_workspace<'a, I>(
     file: &File,
     all_files: I,
+    workspace_complete: bool,
+    cancel: CancellationToken,
 ) -> Option<TypeCheckResult>
 where
-    I: IntoIterator<Item = &'a File>,
+    I: IntoIterator<Item = &'a File> + Clone,
 {
     let ast = file.core_ast()?;
+
+    // C2: per-file inference cache. Try to reuse a previous result for
+    // the same (file content, workspace exports) combination. This pays
+    // off when the worker re-runs typechecks for files that didn't
+    // actually change — most commonly the post-scan refresh of every
+    // open file, and reverse-dependency reschedules where the dependent
+    // file's body wasn't itself edited.
+    let workspace_fp = fingerprint_files(all_files.clone());
+    let file_hash = file.content_hash();
+    if file_hash != 0 {
+        if let Some(cached) =
+            inference_cache_lookup(file_hash, workspace_fp, workspace_complete)
+        {
+            // Cache hits don't need to honour cancellation — we're
+            // returning instantly anyway.
+            return Some((*cached).clone());
+        }
+    }
 
     // Start from the local file env.
     let (mut env, mut pattern_constants) =
         TopLevelEnv::from_ast(file.source.text(), ast);
     apply_callable_signature_metadata(file, &mut env);
 
-    // Build a lightweight pass over workspace files to collect:
-    //   - type aliases
-    //   - pattern constants (enum members)
-    //   - cross-file function names (for existence checks only)
-    //   - cross-file constructor names (for pattern recognition only)
-    //   - cross-file value names (let/var/register/enum-member bindings,
-    //     used by the unresolved-identifier check)
-    //   - cross-file register names (for the `&reg` unresolved check)
-    let mut cross_file_function_names: HashSet<String> = HashSet::new();
-    let mut cross_file_constructor_names: HashSet<String> = HashSet::new();
-    let mut cross_file_value_names: HashSet<String> = HashSet::new();
-    let mut cross_file_register_names: HashSet<String> = HashSet::new();
-    for f in all_files {
-        let Some(other_ast) = f.core_ast() else { continue };
-        for (item, _) in &other_ast.defs {
-            match &item.kind {
-                DefinitionKind::TypeAlias(def) => {
-                    if let Some(target) = &def.target {
-                        let underlying = type_from_type_expr(f.source.text(), target);
-                        env.type_aliases.entry(def.name.0.clone()).or_insert(underlying);
-                    }
-                }
-                DefinitionKind::CallableSpec(spec) => {
-                    cross_file_function_names.insert(spec.name.0.clone());
-                }
-                DefinitionKind::Callable(def) => {
-                    cross_file_function_names.insert(def.name.0.clone());
-                }
-                DefinitionKind::Named(def) => match def.kind {
-                    NamedDefKind::Enum => {
-                        for member in &def.members {
-                            pattern_constants.insert(member.0.clone());
-                            cross_file_value_names.insert(member.0.clone());
-                        }
-                        if let Some(NamedDefDetail::Enum { members, .. }) = &def.detail {
-                            for m in members {
-                                pattern_constants.insert(m.0.name.0.clone());
-                                cross_file_value_names.insert(m.0.name.0.clone());
-                            }
-                        }
-                    }
-                    NamedDefKind::Union => {
-                        if let Some(NamedDefDetail::Union { variants }) = &def.detail {
-                            for v in variants {
-                                cross_file_constructor_names.insert(v.0.name.0.clone());
-                            }
-                        }
-                    }
-                    NamedDefKind::Register => {
-                        cross_file_register_names.insert(def.name.0.clone());
-                        cross_file_value_names.insert(def.name.0.clone());
-                    }
-                    NamedDefKind::Let | NamedDefKind::Var => {
-                        cross_file_value_names.insert(def.name.0.clone());
-                    }
-                    NamedDefKind::Struct => {
-                        if let Some(NamedDefDetail::Struct { fields }) = &def.detail {
-                            for field in fields {
-                                env.known_field_names.insert(field.0.name.0.clone());
-                            }
-                        }
-                    }
-                    NamedDefKind::Bitfield => {
-                        if let Some(NamedDefDetail::Bitfield { fields }) = &def.detail {
-                            for field in fields {
-                                env.known_field_names.insert(field.0.name.0.clone());
-                            }
-                        }
-                    }
-                    NamedDefKind::Overload => {
-                        let entry = env.overloads.entry(def.name.0.clone()).or_default();
-                        for m in &def.members {
-                            if !entry.contains(&m.0) {
-                                entry.push(m.0.clone());
-                            }
-                        }
-                        // Overload names themselves look like callable
-                        // targets, so treat them as function-like.
-                        cross_file_function_names.insert(def.name.0.clone());
-                    }
-                    _ => {}
-                }
-                DefinitionKind::ScatteredClause(def)
-                    if matches!(def.kind, sail_parser::ScatteredClauseKind::Enum) =>
-                {
-                    pattern_constants.insert(def.member.0.clone());
-                    cross_file_value_names.insert(def.member.0.clone());
-                }
-                _ => {}
-            }
-        }
-    }
+    // Look up (or build) the cached cross-file aggregation. The same
+    // workspace fingerprint hits the cache; the heavy `WorkspaceContext`
+    // build only runs when the file set or any file's content changes.
+    let workspace_ctx = cached_workspace_context(all_files);
+    workspace_ctx.apply_to(&mut env, &mut pattern_constants);
 
     // Add own constructors to pattern_constants (so they aren't bindings).
     for name in env.constructors.keys() {
         pattern_constants.insert(name.clone());
     }
-    pattern_constants.extend(cross_file_constructor_names.iter().cloned());
 
-    // Stash the cross-file name sets for use by infer_call's existence check.
-    env.cross_file_function_names = cross_file_function_names;
-    env.cross_file_constructor_names = cross_file_constructor_names;
-    env.cross_file_value_names = cross_file_value_names;
-    env.cross_file_register_names = cross_file_register_names;
-    env.has_workspace_context = true;
+    // Only enable the strict unresolved-identifier check if the caller
+    // confirmed the snapshot represents the full workspace. Otherwise
+    // (e.g. during the race window before the disk scan completes) we'd
+    // flag every cross-file reference as unresolved.
+    env.has_workspace_context = workspace_complete;
 
-    Some(Checker::new(file, env, pattern_constants).check_source_file(ast))
+    let result = Checker::with_cancel(file, env, pattern_constants, cancel.clone())
+        .check_source_file(ast);
+
+    // Only cache complete results — partial output from a cancelled
+    // checker would otherwise poison subsequent lookups.
+    if !cancel.is_cancelled() && file_hash != 0 {
+        inference_cache_store(
+            file_hash,
+            workspace_fp,
+            workspace_complete,
+            Arc::new(result.clone()),
+        );
+    }
+    Some(result)
 }
 
 pub(crate) fn infer_expr_type_text_in_files<'a, I>(
@@ -7896,7 +8941,49 @@ where
     if ty.is_unknown() {
         None
     } else {
-        Some(ty.text())
+        Some(ty.display_text())
+    }
+}
+
+#[cfg(test)]
+mod c1_intern_tests {
+    use super::*;
+
+    #[test]
+    fn primitive_text_types_share_arcs() {
+        let a = Ty::text("int");
+        let b = Ty::text("int");
+        // Both calls go through the intern pool, so they share the
+        // same `Arc<TyData>` instance — equality is a pointer compare.
+        assert!(Arc::ptr_eq(&a.0, &b.0));
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn unknown_is_interned() {
+        let a = Ty::unknown();
+        let b = Ty::unknown();
+        assert!(Arc::ptr_eq(&a.0, &b.0));
+    }
+
+    #[test]
+    fn non_primitive_text_is_not_interned() {
+        let a = Ty::text("Minterrupts");
+        let b = Ty::text("Minterrupts");
+        // Custom names go through `Arc::new` each time. They still
+        // compare equal structurally — just not via pointer-equality.
+        assert!(!Arc::ptr_eq(&a.0, &b.0));
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn nested_clone_is_cheap() {
+        // Building a deep type and cloning it should bump exactly one
+        // refcount on the outer Arc — no recursion into the inner data.
+        let inner = Ty::tuple(vec![Ty::text("int"), Ty::text("bool")]);
+        let outer = Ty::function(vec![inner.clone(), Ty::text("unit")], Ty::text("int"));
+        let cloned = outer.clone();
+        assert!(Arc::ptr_eq(&outer.0, &cloned.0));
     }
 }
 

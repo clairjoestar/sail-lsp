@@ -6,6 +6,7 @@ mod formatting;
 mod handlers;
 mod hover;
 mod inlay_hints;
+mod match_check;
 mod semantic_tokens;
 mod state;
 mod symbols;

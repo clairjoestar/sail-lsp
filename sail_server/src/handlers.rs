@@ -373,6 +373,10 @@ impl LanguageServer for Backend {
             for folder in params.event.removed.iter() {
                 state.disk_files.remove_folder(&folder.uri);
             }
+            // Workspace shape changed — the snapshot is no longer
+            // authoritative until the next scan finishes. Disable the
+            // strict unresolved-identifier check until then.
+            state.workspace_scan_complete = false;
         }
 
         self.schedule_workspace_scan().await;
@@ -450,24 +454,50 @@ impl LanguageServer for Backend {
             )
             .await;
 
-        let uri = &params.text_document.uri;
+        let uri = params.text_document.uri.clone();
         let version = params.text_document.version;
 
-        let typecheck_file = {
+        // Step 1: under the write lock, apply the text content changes to
+        // the open file (cheap — just buffer rope edits) and take a clone
+        // of the now-text-updated file. Cloning is O(arc-bumps) thanks to
+        // the Arc-wrapped derived data, so the lock is released after a
+        // very short critical section. We deliberately do NOT call parse()
+        // here — that runs outside the lock so other LSP requests
+        // (hover, completion, definition...) aren't blocked while we lex
+        // and rebuild the AST/index/signature_index.
+        let mut file = {
             let mut state = self.state.write().await;
-
-            let file = state
-                .open_files
-                .get_mut(uri)
-                .expect("document changed that isn't open");
-            file.update(params.content_changes);
-            let typecheck_file = file.clone();
+            let snapshot = {
+                let Some(open_file) = state.open_files.get_mut(&uri) else {
+                    return;
+                };
+                open_file.update_text(&params.content_changes);
+                open_file.clone()
+            };
             state.diagnostic_versions.insert(uri.clone(), version);
-            typecheck_file
+            snapshot
         };
+
+        // Step 2: parse the clone OUTSIDE any lock. This is the hot path
+        // for typing latency.
+        file.parse();
+        let typecheck_file = file.clone();
+
+        // Step 3: commit the freshly parsed file back into open_files,
+        // unless a newer did_change has already overwritten us.
+        {
+            let mut state = self.state.write().await;
+            let stored_version = state.diagnostic_versions.get(&uri).copied().unwrap_or(0);
+            if stored_version > version {
+                // Newer edit raced past us — drop our parse on the floor.
+                return;
+            }
+            state.open_files.insert(uri.clone(), file);
+        }
+
         self.schedule_debounced_diagnostics(uri.clone(), version);
         if should_schedule_typecheck(&typecheck_file) {
-            self.schedule_debounced_typecheck(uri.clone(), version, typecheck_file);
+            self.schedule_debounced_typecheck(uri, version, typecheck_file);
         }
     }
 

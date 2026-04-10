@@ -18,6 +18,10 @@ pub enum TypeError {
     UnresolvedQuants {
         id: String,
         quants: Vec<String>,
+        /// Pretty-printed callable signature, if known. Surfaced in the
+        /// diagnostic so users can see *which* type variables we couldn't
+        /// resolve from context, instead of just bare names.
+        signature: Option<String>,
     },
     FailedConstraint {
         constraint: String,
@@ -72,13 +76,19 @@ impl TypeError {
                     Some(id.clone()),
                 )
             }
-            TypeError::UnresolvedQuants { id, quants } => (
-                Message::seq([
-                    Message::line(format!("Could not resolve quantifiers for {id}")),
-                    Message::line(format!("* {}", quants.join("\n* "))),
-                ]),
-                None,
-            ),
+            TypeError::UnresolvedQuants {
+                id,
+                quants,
+                signature,
+            } => {
+                let mut lines =
+                    vec![Message::line(format!("Could not resolve quantifiers for {id}"))];
+                if let Some(sig) = signature {
+                    lines.push(Message::line(format!("  signature: {sig}")));
+                }
+                lines.push(Message::line(format!("* {}", quants.join("\n* "))));
+                (Message::Seq(lines), None)
+            }
             TypeError::FailedConstraint {
                 constraint,
                 derived_from,

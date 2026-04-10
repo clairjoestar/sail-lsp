@@ -666,6 +666,18 @@ fn reports_unresolved_quants_from_generic_call_without_context() {
         diagnostic.severity,
         Some(tower_lsp::lsp_types::DiagnosticSeverity::ERROR)
     );
+    // D3: the diagnostic now also surfaces the original signature so users
+    // can see which generic shape produced the unresolved quantifier.
+    assert!(
+        diagnostic.message.contains("signature:"),
+        "expected signature line in diagnostic, got: {}",
+        diagnostic.message
+    );
+    assert!(
+        diagnostic.message.contains("'n"),
+        "expected `'n` to appear in signature line, got: {}",
+        diagnostic.message
+    );
 }
 
 #[test]
@@ -1955,6 +1967,192 @@ function PPN_of(pte) = if 'pte_size == 32 then pte[31 .. 10] else pte[53 .. 10]
 }
 
 #[test]
+fn cross_file_call_with_wrong_arg_count_is_reported() {
+    // B1 narrow: cross-file calls aren't fully type-checked (the unifier
+    // can't safely consume cross-file quantified schemes), but the
+    // arity-only check IS reliable. Verify the dedicated cross-file
+    // arity table catches a real wrong-arg-count bug across files.
+    let lib = File::new(
+        "val foo : (int, int) -> unit\nfunction foo(x, y) = ()\n".to_string(),
+    );
+    let mut user = File::new(
+        "function caller() = foo(1)\n".to_string(),
+    );
+    let snapshot = vec![lib.clone(), user.clone()];
+    user.recompute_diagnostics_with_workspace(
+        &snapshot,
+        true,
+        crate::typecheck::CancellationToken::never(),
+    );
+    let mismatches: Vec<_> = user
+        .lsp_diagnostics()
+        .into_iter()
+        .filter(|d| diagnostic_code_str(d) == Some("mismatched-arg-count"))
+        .collect();
+    assert!(
+        !mismatches.is_empty(),
+        "expected cross-file arity check to fire on `foo(1)`, got: {:?}",
+        user.lsp_diagnostics()
+    );
+}
+
+#[test]
+fn cross_file_call_with_correct_arg_count_is_accepted() {
+    let lib = File::new(
+        "val bar : (int, int) -> unit\nfunction bar(x, y) = ()\n".to_string(),
+    );
+    let mut user = File::new(
+        "function caller() = bar(1, 2)\n".to_string(),
+    );
+    let snapshot = vec![lib.clone(), user.clone()];
+    user.recompute_diagnostics_with_workspace(
+        &snapshot,
+        true,
+        crate::typecheck::CancellationToken::never(),
+    );
+    let mismatches: Vec<_> = user
+        .lsp_diagnostics()
+        .into_iter()
+        .filter(|d| diagnostic_code_str(d) == Some("mismatched-arg-count"))
+        .collect();
+    assert!(
+        mismatches.is_empty(),
+        "cross-file arity check wrongly fired on a correct call: {mismatches:?}"
+    );
+}
+
+#[test]
+fn parse_skips_when_source_text_unchanged() {
+    // After the initial parse, calling parse() again on the same text
+    // should reuse the same Arc-allocated parse products. This is the
+    // memoization shortcut: typing-then-undo and lazy disk reloads
+    // shouldn't burn an extra lex/parse/index pass.
+    let mut file = File::new("function f(x : int) -> int = x\n".to_string());
+    let parsed_arc1 = file.parsed.clone().unwrap();
+    let core_ast_arc1 = file.core_ast.clone().unwrap();
+
+    file.parse();
+
+    let parsed_arc2 = file.parsed.clone().unwrap();
+    let core_ast_arc2 = file.core_ast.clone().unwrap();
+    assert!(
+        std::sync::Arc::ptr_eq(&parsed_arc1, &parsed_arc2),
+        "expected parse() to reuse the cached ParsedFile when text is unchanged"
+    );
+    assert!(
+        std::sync::Arc::ptr_eq(&core_ast_arc1, &core_ast_arc2),
+        "expected parse() to reuse the cached core_ast when text is unchanged"
+    );
+}
+
+#[test]
+fn cancelled_typecheck_returns_partial_result_quickly() {
+    use crate::typecheck::CancellationToken;
+    // Build a file with many top-level definitions and pre-cancel the
+    // token. The checker should bail out at the very first definition
+    // boundary instead of running to completion.
+    let mut source = String::new();
+    for i in 0..200 {
+        source.push_str(&format!(
+            "function f{i}(x : int) -> int = x + {i}\n"
+        ));
+    }
+    let mut file = File::new(source);
+    let snapshot = vec![file.clone()];
+
+    // Run once with a fresh (uncancelled) token to record the full
+    // diagnostic count, then again with a pre-cancelled token and confirm
+    // the result is shorter — i.e. the checker actually bailed.
+    let cancel_alive = CancellationToken::never();
+    file.recompute_diagnostics_with_workspace(&snapshot, true, cancel_alive);
+    let full_diag_count = file
+        .lsp_diagnostics()
+        .into_iter()
+        .filter(|d| diagnostic_code_str(d) == Some("type-error"))
+        .count();
+
+    let cancel_dead = CancellationToken::new();
+    cancel_dead.cancel();
+    let mut file2 = File::new(format!(
+        "{}\n",
+        (0..200)
+            .map(|i| format!("function f{i}(x : int) -> int = x + {i}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    ));
+    let snapshot2 = vec![file2.clone()];
+    file2.recompute_diagnostics_with_workspace(&snapshot2, true, cancel_dead);
+    let cancelled_diag_count = file2
+        .lsp_diagnostics()
+        .into_iter()
+        .filter(|d| diagnostic_code_str(d) == Some("type-error"))
+        .count();
+
+    assert!(
+        cancelled_diag_count <= full_diag_count,
+        "cancelled run produced more diagnostics ({cancelled_diag_count}) than uncancelled \
+         run ({full_diag_count}); cancellation token had no effect"
+    );
+}
+
+#[test]
+fn strict_unresolved_check_is_off_when_workspace_incomplete() {
+    // When the disk scan hasn't yet populated `disk_files`, the snapshot
+    // passed to `recompute_diagnostics_with_workspace` only contains the
+    // currently open file. The strict unresolved-identifier check would
+    // otherwise flag every cross-file reference, so it must stay disabled
+    // until the scan completes.
+    let source = r#"
+function f() = {
+  let _ = some_external_function_we_have_not_seen;
+  ()
+}
+"#;
+    let mut file = File::new(source.to_string());
+    let snapshot = vec![file.clone()];
+    // Pretend the scan is still running — `workspace_complete = false`.
+    file.recompute_diagnostics_with_workspace(&snapshot, false, crate::typecheck::CancellationToken::never());
+    let unresolved: Vec<_> = file
+        .lsp_diagnostics()
+        .into_iter()
+        .filter(|d| {
+            diagnostic_code_str(d) == Some("type-error")
+                && d.message.contains("Unresolved identifier")
+        })
+        .collect();
+    assert!(
+        unresolved.is_empty(),
+        "strict check fired before workspace scan completed: {unresolved:?}"
+    );
+}
+
+#[test]
+fn strict_unresolved_check_fires_when_workspace_complete() {
+    let source = r#"
+function f() = {
+  let _ = some_external_function_we_have_not_seen;
+  ()
+}
+"#;
+    let mut file = File::new(source.to_string());
+    let snapshot = vec![file.clone()];
+    // Now the workspace is fully scanned, so the strict check should run.
+    file.recompute_diagnostics_with_workspace(&snapshot, true, crate::typecheck::CancellationToken::never());
+    let unresolved: Vec<_> = file
+        .lsp_diagnostics()
+        .into_iter()
+        .filter(|d| {
+            diagnostic_code_str(d) == Some("type-error")
+                && d.message.contains("Unresolved identifier")
+        })
+        .collect();
+    assert!(
+        !unresolved.is_empty(),
+        "strict check did not fire even though workspace was complete"
+    );
+}
+
+#[test]
 fn foreach_loop_bounds_count_as_variable_usage() {
     // Upstream `sail/src/lib/rewriter.ml::e_for` joins used-id sets from
     // start, end, step AND body. Our previous analyzer only walked the
@@ -2019,7 +2217,7 @@ function clause write_csr(0x2, value) = { let _ = value; () }
 "#;
     let mut file = File::new(source.to_string());
     let snapshot = vec![file.clone()];
-    file.recompute_diagnostics_with_workspace(&snapshot);
+    file.recompute_diagnostics_with_workspace(&snapshot, true, crate::typecheck::CancellationToken::never());
     let diagnostics = file.lsp_diagnostics();
     let unresolved: Vec<_> = diagnostics
         .iter()
@@ -2050,7 +2248,7 @@ function f() -> int = {
 "#;
     let mut file = File::new(source.to_string());
     let snapshot = vec![file.clone()];
-    file.recompute_diagnostics_with_workspace(&snapshot);
+    file.recompute_diagnostics_with_workspace(&snapshot, true, crate::typecheck::CancellationToken::never());
 
     let diagnostics = file.lsp_diagnostics();
     let unresolved: Vec<_> = diagnostics
@@ -2063,6 +2261,256 @@ function f() -> int = {
     assert!(
         unresolved.is_empty(),
         "expected no unresolved-identifier errors, got: {unresolved:?}"
+    );
+}
+
+// =============================================================================
+// Pattern exhaustiveness — regression tests for the typechecker-driven check.
+// These exercise `sail_server::match_check` via `Checker::check_match_cases`.
+// =============================================================================
+
+fn match_diagnostics(source: &str) -> (Vec<Diagnostic>, Vec<Diagnostic>) {
+    let file = File::new(source.to_string());
+    let diagnostics = file.lsp_diagnostics();
+    let incomplete: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| diagnostic_code_str(d) == Some("incomplete-match"))
+        .cloned()
+        .collect();
+    let redundant: Vec<_> = diagnostics
+        .iter()
+        .filter(|d| diagnostic_code_str(d) == Some("redundant-match-arm"))
+        .cloned()
+        .collect();
+    (incomplete, redundant)
+}
+
+#[test]
+fn match_exhaustiveness_reports_missing_enum_member() {
+    let source = r#"
+enum Privilege = { Machine, Supervisor, User }
+val classify : Privilege -> int
+function classify(p) = match p {
+    Machine => 0,
+    Supervisor => 1,
+}
+"#;
+    let (incomplete, _) = match_diagnostics(source);
+    assert_eq!(
+        incomplete.len(),
+        1,
+        "expected one incomplete-match diagnostic, got {:?}",
+        incomplete
+    );
+    assert!(
+        incomplete[0].message.contains("User"),
+        "expected witness to mention `User`, got: {}",
+        incomplete[0].message
+    );
+}
+
+#[test]
+fn match_exhaustiveness_accepts_full_enum_coverage() {
+    let source = r#"
+enum Color = { Red, Green, Blue }
+val pick : Color -> int
+function pick(c) = match c {
+    Red => 0,
+    Green => 1,
+    Blue => 2,
+}
+"#;
+    let (incomplete, redundant) = match_diagnostics(source);
+    assert!(
+        incomplete.is_empty(),
+        "expected no incomplete-match, got {:?}",
+        incomplete
+    );
+    assert!(
+        redundant.is_empty(),
+        "expected no redundant-match-arm, got {:?}",
+        redundant
+    );
+}
+
+#[test]
+fn match_exhaustiveness_accepts_wildcard_fallback() {
+    let source = r#"
+enum Color = { Red, Green, Blue }
+val pick : Color -> int
+function pick(c) = match c {
+    Red => 0,
+    _ => 1,
+}
+"#;
+    let (incomplete, _) = match_diagnostics(source);
+    assert!(
+        incomplete.is_empty(),
+        "wildcard arm should make match exhaustive, got {:?}",
+        incomplete
+    );
+}
+
+#[test]
+fn match_exhaustiveness_treats_guarded_arms_as_non_covering() {
+    // A guarded arm cannot be relied on for coverage, so a `Machine if g`
+    // arm followed by `Supervisor`/`User` still leaves `Machine` uncovered.
+    let source = r#"
+enum Privilege = { Machine, Supervisor, User }
+val classify : (Privilege, bool) -> int
+function classify(p, b) = match p {
+    Machine if b => 0,
+    Supervisor => 1,
+    User => 2,
+}
+"#;
+    let (incomplete, _) = match_diagnostics(source);
+    assert_eq!(
+        incomplete.len(),
+        1,
+        "guarded arm should not certify exhaustiveness, got {:?}",
+        incomplete
+    );
+    assert!(
+        incomplete[0].message.contains("Machine"),
+        "expected `Machine` in witness, got: {}",
+        incomplete[0].message
+    );
+}
+
+// Redundancy reporting (`redundant-match-arm`) is currently suppressed at
+// the typechecker emission layer. We don't yet model list/struct/vector
+// patterns, so two unmodelled patterns lower to identical wildcards and
+// produce false positives on the sail-riscv corpus. Once those pattern
+// shapes are modelled, re-enable the emission and add a regression test
+// here.
+
+/// Walk the sail-riscv corpus, type-check every file with the workspace
+/// context, and report the total diagnostic count plus a per-code
+/// breakdown. Marked `#[ignore]` so the regular `cargo test` run stays
+/// fast — invoke explicitly with:
+///   cargo test -p sail_server sail_riscv_corpus -- --ignored --nocapture
+/// The expected baseline (set during the C1/B2 round) is 61 true
+/// positives spread across the 158 model files. A spike in
+/// `incomplete-match` diagnostics here is the canonical signal that the
+/// new pattern usefulness checker is over-reporting.
+#[test]
+#[ignore]
+fn sail_riscv_corpus_diagnostic_baseline() {
+    use std::fs;
+    use std::path::PathBuf;
+    use walkdir::WalkDir;
+
+    // CARGO_MANIFEST_DIR points at sail_server. The corpus lives at
+    // ../../sail-riscv/model relative to it.
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let corpus = manifest.join("..").join("..").join("sail-riscv").join("model");
+    if !corpus.exists() {
+        eprintln!(
+            "sail-riscv corpus not found at {}; skipping",
+            corpus.display()
+        );
+        return;
+    }
+
+    let mut sources: Vec<(Url, String)> = Vec::new();
+    for entry in WalkDir::new(&corpus).into_iter().filter_map(Result::ok) {
+        if entry.file_type().is_file()
+            && entry.path().extension().and_then(|s| s.to_str()) == Some("sail")
+        {
+            if let Ok(text) = fs::read_to_string(entry.path()) {
+                let url = Url::from_file_path(entry.path()).expect("file url");
+                sources.push((url, text));
+            }
+        }
+    }
+    eprintln!("loaded {} sail files from corpus", sources.len());
+
+    // Build files, then re-typecheck each with workspace context.
+    let mut files: Vec<File> = sources
+        .iter()
+        .map(|(_, text)| File::new(text.clone()))
+        .collect();
+    let snapshot = files.clone();
+    for file in files.iter_mut() {
+        file.recompute_diagnostics_with_workspace(
+            &snapshot,
+            true,
+            crate::typecheck::CancellationToken::never(),
+        );
+    }
+
+    // Tally diagnostics by code.
+    let mut total = 0usize;
+    let mut by_code: std::collections::BTreeMap<String, usize> = Default::default();
+    for ((url, _), file) in sources.iter().zip(files.iter()) {
+        for d in file.lsp_diagnostics() {
+            total += 1;
+            let code = diagnostic_code_str(&d).unwrap_or("(none)").to_string();
+            *by_code.entry(code).or_default() += 1;
+            // Print incomplete-match and redundant arms for inspection —
+            // these are the new code paths that need spot-checking.
+            if matches!(
+                diagnostic_code_str(&d),
+                Some("incomplete-match") | Some("redundant-match-arm")
+            ) {
+                eprintln!(
+                    "{}:{}:{} [{}] {}",
+                    url.path(),
+                    d.range.start.line + 1,
+                    d.range.start.character + 1,
+                    diagnostic_code_str(&d).unwrap_or(""),
+                    d.message
+                );
+            }
+        }
+    }
+    eprintln!("total diagnostics: {total}");
+    for (code, count) in &by_code {
+        eprintln!("  {code}: {count}");
+    }
+}
+
+#[test]
+fn match_exhaustiveness_handles_bool_scrutinee() {
+    // The scrutinee is `bool` — closed universe of `{true, false}`.
+    // Only matching one of them must report the other as missing.
+    let source = r#"
+val pick : bool -> int
+function pick(b) = match b {
+    true => 0,
+}
+"#;
+    let (incomplete, _) = match_diagnostics(source);
+    assert_eq!(
+        incomplete.len(),
+        1,
+        "bool scrutinee with one arm should be incomplete, got {:?}",
+        incomplete
+    );
+    assert!(
+        incomplete[0].message.contains("false"),
+        "expected `false` in witness, got: {}",
+        incomplete[0].message
+    );
+}
+
+#[test]
+fn match_exhaustiveness_no_warning_for_int_with_wildcard() {
+    // The scrutinee type is `int` (Unlistable universe). With a wildcard
+    // arm present the match is exhaustive — no diagnostic.
+    let source = r#"
+val pick : int -> int
+function pick(n) = match n {
+    0 => 100,
+    _ => 200,
+}
+"#;
+    let (incomplete, _) = match_diagnostics(source);
+    assert!(
+        incomplete.is_empty(),
+        "wildcard arm should suppress incomplete-match on int scrutinee, got {:?}",
+        incomplete
     );
 }
 

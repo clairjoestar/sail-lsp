@@ -6,7 +6,7 @@ use tower_lsp::lsp_types::{CodeLens, Range, SymbolKind, Url};
 pub(crate) fn collect_reference_counts(files: &[(&Url, &File)]) -> HashMap<String, usize> {
     let mut counts = HashMap::<String, usize>::new();
     for (_, file) in files {
-        for (name, count) in &file.ref_counts {
+        for (name, count) in file.ref_counts.iter() {
             *counts.entry(name.clone()).or_insert(0) += count;
         }
     }
@@ -16,7 +16,7 @@ pub(crate) fn collect_reference_counts(files: &[(&Url, &File)]) -> HashMap<Strin
 pub(crate) fn collect_implementation_counts(files: &[(&Url, &File)]) -> HashMap<String, usize> {
     let mut counts = HashMap::<String, usize>::new();
     for (_, file) in files {
-        for (name, count) in &file.impl_counts {
+        for (name, count) in file.impl_counts.iter() {
             *counts.entry(name.clone()).or_insert(0) += count;
         }
     }
